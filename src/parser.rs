@@ -4,7 +4,8 @@ use crate::gc::{Gc, NO_GC};
 use crate::lexer::*;
 use crate::token::*;
 use crate::value::*;
-use crate::vm::*;
+use std::cell:RefCell;
+use std::rc::Rc;
 
 pub(crate) const MAX_LOCALS: usize = 256;
 pub(crate) const MAX_UPVALUES: usize = 256;
@@ -92,20 +93,23 @@ struct LexerData {
     prev: Token,
 }
 
-struct Parser {
-    gc: &Gc,
+pub struct Parser <'a> {
+    compiler: Compiler,
+    vm: VM,
+    gc: Gc,
     lexer_stack: Vec<LexerData>,
     error_count: usize,
-    //compiler: Compiler,
     in_panic_mode: bool,
     in_panic_lock_mode: bool,
 
 }
 
 impl<'a> Parser {
-    fn new(gc: &Gc, debug: bool) -> Self {
+    fn new(debug: bool, compile: bool) -> Self {
         let mut s = Self {
-            gc,
+            compiler: Compiler::new(),
+            vm: VM::new(),
+            gc: Gc::new(),
             lexer_stack: vec![],
             in_panic_mode: false,
             in_panic_lock_mode: false,
@@ -223,21 +227,17 @@ impl<'a> Parser {
         s
     }
 
-    pub fn parse_text(&self, text: String) -> Result<Value, InterpretErrorType> {
+    pub fn parse_text(&self, text: &mut String) -> Result<Value, InterpretErrorType> {
         self.lexer_stack = vec![];
         self.error_count = 0;
         self.in_panic_mode = false;
         self.in_panic_lock_mode = false;
 
-        let lexer = Lexer::new_from_text(text);
-
-        if lexer.is_err() {
-            return Err(InterpretErrorType::ParseError)
-        }
+        let lexer = Lexer::new_from_text(text); 
 
         self.lexer_stack.clear();
         self.lexer_stack.push(LexerData {
-            lexer: lexer.unwrap(),
+            lexer: Some(lexer),
             curr: Token {
                 kind: TokenKind::None,
                 ty: TokenType::None,
@@ -268,14 +268,14 @@ impl<'a> Parser {
         self.in_panic_mode = false;
         self.in_panic_lock_mode = false;
 
-        let lexer = Some(Lexer::new_from_file(fname));
+        let lexer = Lexer::new_from_file(fname);
 
-        if lexer.is_err() {
+        if lexer.is_none() {
             return Err(InterpretErrorType::ParseError)
         }
 
         self.lexer_stack.push(LexerData {
-            lexer: lexer.unwrap(),
+            lexer: lexer,
             curr: Token {
                 kind: TokenKind::None,
                 ty: TokenType::None,
@@ -307,7 +307,7 @@ impl<'a> Parser {
             self.lexer_stack.last_mut().unwrap().curr.clone();
         loop {
             self.lexer_stack.last_mut().unwrap().curr =
-                self.lexer_stack.last_mut().unwrap().lexer.scan(gc);
+                *self.lexer_stack.last_mut().unwrap().scan(gc);
             if self.current().kind != TokenKind::Err {
                 break;
             }
@@ -345,7 +345,7 @@ impl<'a> Parser {
 
         eprint!(
             "{}:{}:{}: error",
-            self.lexer_stack.last_mut().unwrap().lexer.file_name(),
+            *self.lexer_stack.last_mut().unwrap().file_name(),
             token.line,
             token.col
         );
@@ -389,7 +389,7 @@ impl<'a> Parser {
     }
 
     // Entry point of parser
-    fn parse(gc: &Gc) -> bool {
+    fn parse(&self, gc: &Gc) -> bool {
         while self.current().kind != TokenKind::Done {
             let _ = self.current().kind;
             let left = self.parse_stmt(gc);
@@ -414,7 +414,7 @@ impl<'a> Parser {
     // Pratt Parser methods
 
     // Synchronizes the error system
-    fn synchronize_error(&mut self, gc: &Gc) -> bool {
+    fn synchronize_error(&mut self, gc: &Gc) {
         self.in_panic_mode = false;
 
         while self.current().kind != TokenKind::Done {
@@ -510,7 +510,7 @@ impl<'a> Parser {
             TokenKind::LetKw => Some(BindingPower::NoBp),
             TokenKind::ReturnKw => Some(BindingPower::NoBp),
             TokenKind::LBrace => Some(BindingPower::NoBp),
-            _ => false,
+            _ => None,
         }
     }
 
@@ -528,7 +528,7 @@ impl<'a> Parser {
             }
             TokenKind::AnonClosure => Some(BindingPower::Call),
             TokenKind::FunKw => Some(BindingPower::Call),
-            _ => false,
+            _ => None,
         }
     }
 
@@ -555,7 +555,7 @@ impl<'a> Parser {
             | TokenKind::LShiftAssign
             | TokenKind::RShiftAssign => Some(BindingPower::Assignment),
             TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => Some(BindingPower::Call),
-            _ => Nonw,
+            _ => None,
         }
     }
 
@@ -564,7 +564,7 @@ impl<'a> Parser {
         let tk = self.current().kind;
         let stmt = self.stmt_bp(tk.clone());
         if stmt.is_some() {
-            node = self.call_stmt_fn(tk.clone(), false, gc);
+            node = self.call_stmt_fn(tk.clone(), gc);
             if self.in_panic_mode {
                 self.advance(gc);
                 self.synchronize_error(gc);
@@ -584,7 +584,7 @@ impl<'a> Parser {
     fn parse_expr(&mut self, gc: &Gc, bp: BindingPower) -> bool {
         let mut tk = self.current().kind;
         let prefix = self.prefix_bp(tk);
-        if prefix.is_false() {
+        if prefix.is_none() {
             self.error_at_curr("expression expected".to_string());
             return false;
         }
@@ -593,7 +593,7 @@ impl<'a> Parser {
 
         tk = self.current().kind;
         let mut infix = self.infix_bp(tk);
-        if infix.is_false() {
+        if infix.is_none() {
             return l;
         }
         while <BindingPower as Into<u8>>::into(bp.clone())
@@ -601,7 +601,7 @@ impl<'a> Parser {
         {
             tk = self.current().kind;
             infix = self.infix_bp(tk);
-            if infix.is_false() {
+            if infix.is_none() {
                 return l;
             }
             l = self.call_infix_fn(l, gc);
@@ -626,7 +626,7 @@ impl<'a> Parser {
         );
 
         let e = self.parse_expr(false, gc, BindingPower::Assignment);
-        if e.is_false() {
+        if e.is_none() {
             return false;
         }
 
@@ -668,9 +668,9 @@ impl<'a> Parser {
     fn parse_if_stmt(&mut self, gc: &Gc) -> bool{
         self.advance(gc);
         let if_expr = self.parse_expr(gc, BindingPower::Assignment);
-        if if_expr.is_some() {
+        if if_expr {
             self.advance(gc);
-            let else_expr = self.parse_expr(if_expr, gc, BindingPower::Assignment);
+            let else_expr = self.parse_expr(gc, BindingPower::Assignment);
             return else_expr;
         }
         false
@@ -680,8 +680,7 @@ impl<'a> Parser {
 
     fn parse_anon_closure(&mut self, gc: &Gc) -> bool {
         self.advance(gc);
-        let mut params: Vec<Box<Ast>> = vec![];
-        let mut code: Vec<Box<Ast>> = vec![];
+        let mut params: Vec<String> = vec![];
 
         loop {
             if !self.check(TokenKind::RParen) {
@@ -715,8 +714,8 @@ impl<'a> Parser {
 
         while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Done) {
             let mut l = false;
-            l = self.parse_stmt(l, gc);
-            if let Some(v) = l {
+            l = self.parse_stmt(gc);
+            if let v = l {
                 code.push(v);
             } else {
             }
@@ -734,10 +733,9 @@ impl<'a> Parser {
         }
     }
 
-    fn parse_named_closure(&mut self, gc: &Gc) -> Option<Box<Ast>> -> bool {
+    fn parse_named_closure(&mut self, gc: &Gc) -> bool {
         self.advance(gc);
-        let mut params: Vec<Box<Ast>> = vec![];
-        let mut code: Vec<Box<Ast>> = vec![];
+        let mut params: Vec<String> = vec![];
 
         if !self.consume(
             TokenKind::Ident,
@@ -765,11 +763,7 @@ impl<'a> Parser {
                     self.advance(gc);
                 }
 
-                let param = Box::new(Ast::Variable {
-                    name: self.previous().lexeme.clone(),
-                    arity: false,
-                });
-                params.push(param);
+                
             }
             if !self.match_token(TokenKind::Comma, gc) {
                 break;
@@ -794,8 +788,8 @@ impl<'a> Parser {
 
         while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Done) {
             let mut l = false;
-            l = self.parse_stmt(l, gc);
-            if let Some(v) = l {
+            l = self.parse_stmt(gc);
+            if let v = l {
                 code.push(v);
             } else {
             }
@@ -809,21 +803,18 @@ impl<'a> Parser {
             self.advance(gc);
         }
 
-        if self.error_count > 0 {
-            false;
+        let ret = if self.error_count > 0 {
+            false
         } else {
             true
-        }
-
-        
+        } 
     }
 
-    fn parse_return_stmt(&mut self, gc: &Gc) -> bool{
+    fn parse_return_stmt(&mut self, gc: &Gc) -> bool {
         self.advance(gc);
-        let mut ret_expr: Option<Box<Ast>> = false;
         if !self.match_token(TokenKind::Semicolon, gc) {
-            ret_expr = self.parse_expr(gc, BindingPower::Assignment);
-            if ret_expr.is_false() {
+            let ret_expr = self.parse_expr(gc, BindingPower::Assignment);
+            if !ret_expr {
                 return false;
             }
         }
@@ -844,16 +835,8 @@ impl<'a> Parser {
     fn parse_block(&mut self, gc: &Gc) -> bool{
         self.advance(gc);
 
-        let mut list: Vec<Box<Ast>> = vec![];
-
         while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Done) {
-            let mut l: Option<Box<Ast>> = false;
-            l = self.parse_stmt(l, gc);
-            if let Some(i) = l {
-                list.push(i.clone());
-            } else {
-                return false;
-            }
+            self.parse_stmt(gc); 
         }
 
         if !self.consume(
@@ -866,16 +849,16 @@ impl<'a> Parser {
 
         if self.error_count > 0 {
             false
+        } else {
+            true
         }
-
-        true
     }
 
     fn parse_expr_stmt(&mut self, gc: &Gc) -> bool {
         // generate expression nodes
         let node = self.parse_expr(gc, BindingPower::Assignment);
 
-        if node.is_false() {
+        if node.is_none() {
             return false;
         }
 
@@ -931,7 +914,7 @@ impl<'a> Parser {
     }
 
     fn parse_argument_list(&mut self, gc: &Gc) -> Option<Vec<String>> {
-        let mut arg_list: Vec<Box<String>> = vec![];
+        let mut arg_list: Vec<String>> = vec![];
         if !self.check(TokenKind::RParen) {
             while !self.check(TokenKind::RParen) && !self.check(TokenKind::Done) {
                 println!("curr = {:#?}", self.current());
@@ -960,7 +943,7 @@ impl<'a> Parser {
         self.advance(gc);
         let arg_list = self.parse_argument_list(left.clone(), gc);
 
-        if arg_list.is_false() {
+        if arg_list.is_none() {
             false;
         } else {
             true
@@ -993,14 +976,13 @@ impl<'a> Parser {
     fn parse_addition(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1014,14 +996,13 @@ impl<'a> Parser {
     fn parse_subtraction(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1035,14 +1016,13 @@ impl<'a> Parser {
     fn parse_multiplication(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1056,14 +1036,13 @@ impl<'a> Parser {
     fn parse_division(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1077,14 +1056,13 @@ impl<'a> Parser {
     fn parse_modulo(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1099,14 +1077,13 @@ impl<'a> Parser {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
 
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1120,7 +1097,7 @@ impl<'a> Parser {
     fn parse_land(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
@@ -1128,7 +1105,6 @@ impl<'a> Parser {
             self.advance(gc);
 
             let right = self.parse_expr(
-                left.clone(),
                 gc,
                 BindingPower::from(<BindingPower as Into<u8>>::into(bp.clone().unwrap()) + 1),
             );
@@ -1145,7 +1121,7 @@ impl<'a> Parser {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         let mut right = false;
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
@@ -1153,7 +1129,6 @@ impl<'a> Parser {
             self.advance(gc);
 
             right = self.parse_expr(
-                left.clone(),
                 gc,
                 BindingPower::from(<BindingPower as Into<u8>>::into(bp.clone().unwrap()) + 1),
             );
@@ -1167,7 +1142,6 @@ impl<'a> Parser {
             self.advance(gc);
 
             let right = self.parse_expr(
-                left.clone(),
                 gc,
                 BindingPower::from(<BindingPower as Into<u8>>::into(bp.clone().unwrap()) + 1),
             );
@@ -1183,14 +1157,13 @@ impl<'a> Parser {
     fn parse_and(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1202,14 +1175,13 @@ impl<'a> Parser {
     fn parse_or(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1221,14 +1193,13 @@ impl<'a> Parser {
     fn parse_xor(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1240,14 +1211,13 @@ impl<'a> Parser {
     fn parse_lshift(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1259,14 +1229,13 @@ impl<'a> Parser {
     fn parse_rshift(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1278,14 +1247,13 @@ impl<'a> Parser {
     fn parse_compound_addition(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1297,14 +1265,13 @@ impl<'a> Parser {
     fn parse_compound_subtraction(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1316,14 +1283,13 @@ impl<'a> Parser {
     fn parse_compound_multiplication(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1335,14 +1301,13 @@ impl<'a> Parser {
     fn parse_compound_division(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1354,14 +1319,13 @@ impl<'a> Parser {
     fn parse_compound_modulo(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1373,14 +1337,13 @@ impl<'a> Parser {
     fn parse_compound_power(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1392,14 +1355,13 @@ impl<'a> Parser {
     fn parse_compound_and(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1411,14 +1373,13 @@ impl<'a> Parser {
     fn parse_compound_or(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1430,14 +1391,13 @@ impl<'a> Parser {
     fn parse_compound_xor(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1449,14 +1409,13 @@ impl<'a> Parser {
     fn parse_compound_lshift(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1468,14 +1427,13 @@ impl<'a> Parser {
     fn parse_compound_rshift(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
         self.advance(gc);
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
@@ -1487,7 +1445,7 @@ impl<'a> Parser {
     fn parse_assignment(&mut self, gc: &Gc) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
-        if bp.is_false() {
+        if bp.is_none() {
             return false;
         }
 
@@ -1495,7 +1453,6 @@ impl<'a> Parser {
 
 
         let right = self.parse_expr(
-            left.clone(),
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap() + 1)),
         );
@@ -1540,26 +1497,87 @@ mod tests {
         assert_eq!(result, Ok(Value::Int(10)));
     }
 
-    fn prep_for_test() -> (VM, Gc) -> bool {
+    fn prep_for_test() -> (VM, Gc) {
         (VM::new(), Gc::new())
     }
 }
 
 
-#[derive(Clone)]
-pub struct SymbolTables {
-    mods: Option<Rc<RefCell<Modules>>>,
-    old_mods: Rc<RefCell<Modules>>,
+
+
+struct Compiler {
+    symbols: SymbolTables,
+
+}
+
+impl Compiler {
+    fn new() -> Self {
+        SymbolTables::new()
+    }
+
+    #[inline]
+    fn register_mod(
+
+
+    #[inline]
+    fn get_mod(
+        &self, 
+        name: String
+    ) -> Result<Module, String> {
+        self.symbols.get_mod(self, name)
+    }
+
+    #[inline]
+    fn declare_fun(
+        &self,
+        mut name: String,
+        params: Vec<VarEntry>
+        parent: Option<Rc<FunEnv>>,
+        fun_type: FunctionType,
+    ) -> Result<usize, String>
+        
+        name += "(" + params.len().to_string() + ")";
+
+        if params.len() >= 16 {
+            return format!("Too many parameters for function '{}'", name);
+        }
+
+        self.look_up_var(name);
+}
+
+struct SymbolTables {
+    mods: Modules,
+    calls: Vec<CallEnv>
 }
 
 impl SymbolTables {
     fn new() -> Self {
-        Self {
+        let mut self = Self {
             mods: Modules::new(),
+            calls: vec![],
         }
+
+        let _ = self.declare_fun(
+            " main".to_string(),
+            vec![],
+            None,
+            FunctionType::Main,
+        )
+        self
     }
 
-    fn get_mod(&self, name: String) -> Result<Module, String> {
+    fn declare_mod(
+        &self,
+        name: String
+    ) -> Option<usize> {
+        self.mod.declare_mod(
+            name,
+        )
+    }
+    fn get_mod(
+        &self, 
+        name: String
+    ) -> Result<Module, String> {
         let res = self.mods.get(name);
         if res.is_some() {
             Ok(res.unwrap())
@@ -1567,6 +1585,32 @@ impl SymbolTables {
             Err(format!("Module '{}' doesn't exist", name))
         }
     }
+
+    fn declare_fun(
+        name: String, 
+        params: Vec<VarEntry>, 
+        parent: Option<Rc<FunEnv>>,
+        fun_type: FunctionType
+    ) -> usize {
+        calls.push(FunEnv::new(
+            name,
+            params,
+            parent,
+            fun_type,
+        ))
+        calls.len()
+    }
+
+    fn declare_local(
+        name: String,
+        local_scope: usize,
+        dist_from_top: usize,
+    ) -> VarEntry {
+        VarEntry::new(
+            name,
+            VarType::Function
+            local_scope,
+
 }
 
 pub struct Modules {
@@ -1575,15 +1619,20 @@ pub struct Modules {
 
 impl Modules {
     fn new(&self) -> Self {
-        Self {
-            mod_table: HashMap::<String, Module>::new(),
+        self = Self {
+            mod_table: HashMap::<String, usize>::new(),
             mods: Vec::new(),
         }
+        self.mod_table.insert("global", 0);
+        self.mods.push(Module::new());
     }
 
-    fn define_mod(&self, name: String) -> Result<(), String> {
+    fn declare_mod(
+        &self, 
+        name: String
+    ) -> Result<(), String> {
         if self.mod_table.len() == MAX_MODULES {
-            Err(format!("Module limit exceeded for module '{}'", name))
+            Err(format!("Module limit exceeded'", name))
         } else {
             let id = self.mod_table.len();
             self.mod_table.insert(name, id);
@@ -1592,49 +1641,119 @@ impl Modules {
     }
 }
 
-type FuncEnv = Environment;
-
-pub struct Module {
+struct Module {
     mod_name: String,
     mod_index: usize,
-    value: Option<Value>,
-    mod_parent: Option<Module>,
+    mod_parent: Option<Rc<Module>>,
     mod_vars: HashMap<String, VarEntry>,
-    mod_env: Environment,
 }
 
-pub struct Environment {
-    vars: Rc<RefCell<HashMap<String, VarEntry>>>,
-    env_parent: Option<Rc<RefCell<Environment>>>,
+impl Module {
+    fn new(
+        name: String,
+        index: usize,
+        parent: Option<Rc<Module>>,
+    ) -> {
+        Self {
+            mod_name: name,
+            mod_index: index,
+            mod_parent: parent,
+            mod_vars: HashMap::<String, VarEntry>::new(),
+        }
+    }
+
+    fn declare_mod_var(
+        
 }
 
-pub struct VarEntry {
+struct FunEnv {
+    locals: Rc<RefCell<HashMap<String, Option<VarEntry>>>>,
+    env_parent: Option<Rc<RefCell<FunEnv>>>,
+}
+
+impl FunEnv {
+    fn new(parent: Option<Rc<RefCell<FunEnv>>>) {
+        Self {
+            locals: Rc::new(RefCell::new(HashMap::new())),
+            env_parent: parent,
+        }
+    }
+
+
+}
+
+#[derive(Clone)]
+struct VarEntry {
     name: String,
+    arity: Option<usize>,
     var_type: VarType,
-    var_index: usize,
-    value: Option<Value>,
-    var_mod: Option<Module>,
+    scope_type: ScopeType,
+    scope: usize,
+    index: usize,
+    upvalue_local_index: usize,
+    var_mod: Option<Rc<Module>>,
 }
 
 impl VarEntry {
-    pub fn new(name: String, var_type: VarType, value: Option<Value>) -> Self {
+    fn new(
+        name: String,
+        arity: Option<usize>,
+        var_type: VarType,
+        scope_type: ScopeType,
+        scope: usize,
+        index: usize,
+        upvalue_local_index: usize,
+        var_mod: Option<Rc<Module>>,
+    ) -> Self {
+        Self {
+            name,
+            arity,
+            var_type,
+            scope_type,
+            scope,
+            index,
+            upvalue_local_index,
+        }
+    }
+}
+
+
+struct VarEntry {
+    name: String,
+    var_type: VarType,
+    var_index: usize,
+    var_scope: usize,
+    value: Value,
+    var_mod: Option<Rc<Module>>,
+}
+
+impl VarEntry {
+    pub fn new(
+        name: String, 
+        var_type: VarType,
+        dist_from_top: usize,
+        can_be_optimized: bool,
+        value: Option<Value>
+    ) -> Self {
         Self {
             name,
             var_type,
+            dist_from_top,
+            true,
             value,
         }
     }
 
-    pub fn get_name() -> String {
-        name.clone()
+    pub fn get_name(&self) -> String {
+        self.name.clone()
     }
 
-    pub fn get_type() -> VarType {
-        var_type.clone()
+    pub fn get_type(&self) -> VarType {
+        self.var_type.clone()
     }
 
-    pub fn get_value() -> Option<Value> {
-        value.clone()
+    pub fn get_value(&self) -> Option<Value> {
+        self.value.clone()
     }
 }
 
@@ -1658,58 +1777,53 @@ fn emit_var_load(&mut self, fc: &mut FunCompiler, var: VarInfo) {
 
 fn emit_math_op<'a>(
     &mut self,
-    ast: &mut Option<Box<Ast>>,
-    vm: *mut VM,
+    tk: TokenKind,
+    l: &Value,
+    r: &Value,
     gc: &Gc,
 ) -> Option<Managed<Closure>> {
-    if let Some(node) = ast {
-        if let Some(last) = unsafe { (*vm).compiler.fc_vec.last_mut() } {
-            match **node {
-                Ast::Add(ref left, ref right) => {
-                    self.code_gen(&mut left.clone(), vm, gc);
-                    self.code_gen(&mut right.clone(), vm, gc);
-                    last.emit_math_op(MathOp::Add);
-                    last.closure
-                }
-                Ast::Subtract(ref left, ref right) => {
-                    self.code_gen(&mut left.clone(), vm, gc);
-                    self.code_gen(&mut right.clone(), vm, gc);
-                    last.emit_math_op(MathOp::Subtract);
-                    last.closure
-                }
-                Ast::Multiply(ref left, ref right) => {
-                    self.code_gen(&mut left.clone(), vm, gc);
-                    self.code_gen(&mut right.clone(), vm, gc);
-                    last.emit_math_op(MathOp::Multiply);
-                    last.closure
-                }
-                Ast::Divide(ref left, ref right) => {
-                    self.code_gen(&mut left.clone(), vm, gc);
-                    self.code_gen(&mut right.clone(), vm, gc);
-                    last.emit_math_op(MathOp::Divide);
-                    last.closure
-                }
-                Ast::Modulo(ref left, ref right) => {
-                    self.code_gen(&mut left.clone(), vm, gc);
-                    self.code_gen(&mut right.clone(), vm, gc);
-                    last.emit_math_op(MathOp::Modulo);
-                    last.closure
-                }
-                Ast::Power(ref left, ref right, ..) => {
-                    self.code_gen(&mut left.clone(), vm, gc);
-                    self.code_gen(&mut right.clone(), vm, gc);
-                    last.emit_math_op(MathOp::Power);
-                    last.closure
-                }
-                _ => {
-                    unreachable!();
-                }
-            }
-        } else {
-            panic!("function compiler stack is empty");
+    match tk {
+        TokenKind::Add {
+            self.code_gen(l.clone(), gc);
+            self.code_gen(r.clone(), gc);
+            last.emit_math_op(MathOp::Add);
+            last.closure
+        }
+        TokenKind::Subtract => {
+            self.code_gen(l.clone(), gc);
+            self.code_gen(r.clone(), vm, gc);
+            last.emit_math_op(MathOp::Subtract);
+            last.closure
+        }
+        TokenKind::Multiply => {
+            self.code_gen(l.clone(), vm, gc);
+            self.code_gen(r.clone(), vm, gc);
+            last.emit_math_op(MathOp::Multiply);
+            last.closure
+        }
+        TokenKind::Divide => {
+            self.code_gen(l.clone(), gc);
+            self.code_gen(r.clone(), gc);
+            last.emit_math_op(MathOp::Divide);
+            last.closure
+        }
+        TokenKind::Modulo => {
+            self.code_gen(l.clone(), gc);
+            self.code_gen(r.clone(), gc);
+            last.emit_math_op(MathOp::Modulo);
+            last.closure
+        }
+        TokenKind::Power => {
+            self.code_gen(l.clone(), gc);
+            self.code_gen(r.clone(), gc);
+            last.emit_math_op(MathOp::Power);
+            last.closure
+        }
+        _ => {
+            unreachable!();
         }
     } else {
-        panic!("ast node doesn't exist");
+        panic!("current token kind is invalid");
     }
 }
 
@@ -1779,4 +1893,1744 @@ fn emit_math_op(&mut self, op: MathOp) {
     println!("gen: {} op {}", OpCode::MathOp, op);
     self.code.push(u8::from(OpCode::MathOp));
     self.code.push(u8::from(op));
+}
+
+
+
+
+
+use crate::closure::Closure;
+use crate::function_core::{FunctionCore, FunctionType};
+use crate::managed::*;
+use crate::opcode::*;
+use ordered_float::*;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq)]
+struct CallFrame {
+    fun: Value,
+    closure: Option<Managed<Closure>>,
+    core: Option<Managed<FunctionCore>>,
+    pc: usize,
+    fp: usize,
+}
+
+impl CallFrame {
+    pub fn new(fun: Value) -> Self {
+        let _closure: Option<Managed<Closure>> = None;
+        let _core: Option<Managed<FunctionCore>> = None;
+
+        match fun {
+            Value::Closure(c) => Self {
+                fun,
+                closure: Some(c),
+                core: Some(c.get_core()),
+                pc: 0,
+                fp: 0,
+            },
+            _ => {
+                panic!("'{}' got pushed onto the call stack!", fun);
+            }
+        }
+    }
+    pub fn get_fun(&self) -> &Value {
+        &self.fun
+    }
+
+    pub fn get_closure(&self) -> Option<Managed<Closure>> {
+        self.closure
+    }
+
+    fn get_core(&self) -> Option<Managed<FunctionCore>> {
+        self.core
+    }
+
+    fn get_pc(&self) -> usize {
+        self.pc.clone()
+    }
+
+    fn inc_pc(&mut self, amount: usize) -> Option<usize> {
+        if self.pc + amount > 200_000 {
+            None
+        } else {
+            self.pc += amount;
+            Some(self.pc)
+        }
+    }
+
+    fn dec_pc(&mut self, amount: usize) -> Option<usize> {
+        let mut new_pc = self.pc as isize;
+        new_pc -= amount as isize;
+        if new_pc < 0 {
+            None
+        } else {
+            self.pc -= amount;
+            Some(self.pc)
+        }
+    }
+
+    #[inline]
+    fn get_fp(&self) -> usize {
+        self.fp
+    }
+
+    #[inline]
+    fn set_fp(&mut self, index: usize) -> usize {
+        self.fp = index;
+        self.fp
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CallStack {
+    stack: Vec<CallFrame>,
+}
+
+impl CallStack {
+    fn new() -> Self {
+        Self { stack: vec![] }
+    }
+
+    #[inline]
+    fn get_fp(&self) -> usize {
+        self.stack.last().unwrap().get_fp()
+    }
+
+    #[inline]
+    fn set_fp(&mut self, index: usize) {
+        self.stack.last_mut().unwrap().set_fp(index);
+    }
+
+    #[inline]
+    fn get_pc(&self) -> usize {
+        self.stack.last().unwrap().get_pc()
+    }
+
+    fn clear_pc(&mut self) {
+        self.stack.last_mut().unwrap().pc = 0;
+    }
+
+    #[inline]
+    fn inc_pc(&mut self, amount: usize) -> Option<usize> {
+        if let Some(last) = self.stack.last_mut() {
+            last.inc_pc(amount)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn dec_pc(&mut self, amount: usize) -> Option<usize> {
+        if let Some(last) = self.stack.last_mut() {
+            last.dec_pc(amount)
+        } else {
+            None
+        }
+    }
+
+    fn top(&self) -> Option<CallFrame> {
+        if let Some(last) = self.stack.last() {
+            return Some(last.clone());
+        } else {
+            None
+        }
+    }
+
+    fn next_from_top(&self) -> Option<CallFrame> {
+        if self.stack.len() > 1 {
+            let tmp = self.stack.len() - 2;
+            let nxt = self.stack[tmp].clone();
+            Some(nxt)
+        } else {
+            None
+        }
+    }
+
+    fn push(&mut self, fun: Value) {
+        self.stack.push(CallFrame::new(fun))
+    }
+
+    fn pop(&mut self) -> Option<CallFrame> {
+        self.stack.pop()
+    }
+
+    fn clear(&mut self) {
+        self.stack.clear();
+    }
+
+    #[allow(unused_assignments)]
+    pub(crate) fn get_backtrace(&self) -> String {
+        let mut string = format!("\nBacktrace:\n");
+
+        let mut iter = self.stack.iter();
+        loop {
+            let elem = iter.next();
+            if elem.is_none() {
+                break;
+            }
+
+            let mut arity = 0usize;
+            let mut name = String::from("");
+            let mut fun_ty = FunctionType::NamedClosure;
+            let mut fun_ty_name = String::from("");
+            let filename = String::from("");
+            if let Some(f) = elem {
+                match f.fun {
+                    Value::Closure(c) => {
+                        name = c.get_core().get_name();
+                        arity = c.get_core().get_arity();
+                        fun_ty = c.get_core().get_type();
+                        match fun_ty {
+                            FunctionType::TopLevel => {
+                                fun_ty_name = String::from("top-level");
+                            }
+                            FunctionType::NamedClosure => {
+                                fun_ty_name = String::from("named closure");
+                            }
+                            FunctionType::AnonClosure => {
+                                fun_ty_name = String::from("anonymous closure");
+                            }
+                            _ => {
+                                unreachable!();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                string = string
+                    + &format!(
+                        "[ {} {}(#{}) at {} line {} ]\n\n",
+                        fun_ty_name, name, arity, filename, 0,
+                    );
+            }
+        }
+        string
+    }
+}
+
+pub fn is_none(x: Value) -> bool {
+    x == Value::Nil || (x.is_bool() && !x.as_bool())
+}
+
+macro_rules! read_byte {
+    ($pc:ident, $code:ident, $out:ident) => {
+        $pc += 1;
+        let $out = $code[$pc - 1];
+    };
+}
+
+macro_rules! read_word {
+    ($pc:ident, $code:ident, $out:ident) => {
+        $pc += 2;
+        let $out = (($code[$pc - 2] as usize) << 8usize) | $code[$pc - 1] as usize;
+    };
+}
+
+#[allow(dead_code)]
+struct VM {
+    vars: Vec<Value>,
+    main_fun: Option<Managed<Closure>>, 
+    calls: CallStack,
+    stack: Vec<Value>,
+    sp: usize,
+}
+
+#[allow(dead_code)]
+impl VM {
+    pub fn new() -> Self {
+        Self {
+            vars: Vec::<Value>::new(),
+            main_fun: None,
+            calls: CallStack::new(),
+            stack: Vec::<Value>::new(),
+            sp: 0usize,
+        }
+    } 
+
+    #[inline]
+    fn get_sp(&self) -> usize {
+        self.sp
+    }
+
+    #[inline]
+    fn set_sp(&mut self, index: usize) {
+        self.sp = index;
+    }
+
+    #[inline]
+    fn get_fp(&self) -> usize {
+        self.calls.get_fp()
+    }
+
+    #[inline]
+    fn set_fp(&mut self, index: usize) {
+        self.calls.set_fp(index);
+    }
+    #[inline]
+    fn get_pc(&mut self) -> Option<usize> {
+        if let Some(frame) = self.calls.top() {
+            Some(frame.get_pc())
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn inc_pc(&mut self, amount: usize) -> Option<usize> {
+        if let Some(mut frame) = self.calls.top() {
+            frame.inc_pc(amount)
+        } else {
+            None
+        }
+    }
+    #[inline]
+    fn dec_pc(&mut self, amount: usize) -> Option<usize> {
+        if let Some(mut frame) = self.calls.top() {
+            frame.dec_pc(amount)
+        } else {
+            None
+        }
+    }
+    fn get_stack_at_index(&mut self, index: usize) -> Option<Value> {
+        if let Some(val) = self.stack.get(index) {
+            Some((*val).clone())
+        } else {
+            None
+        }
+    }
+
+    fn get_stack_top(&mut self) -> Option<Value> {
+        if let Some(val) = self.stack.last_mut() {
+            Some((*val).clone())
+        } else {
+            None
+        }
+    }
+
+    fn stack_push(&mut self, value: Value) {
+        self.stack.push(value);
+    }
+
+    fn stack_pop(&mut self) {
+        self.stack.pop();
+    }
+
+    fn get_var(&mut self, index: usize) -> Option<Value> {
+        if let Some(val) = self.vars.get_mut(index) {
+            Some((*val).clone())
+        } else {
+            None
+        }
+    }
+
+    fn set_var(&mut self, index: usize, value: Value) {
+        if let Some(val) = self.vars.get_mut(index) {
+            *val = value;
+        }
+    }
+
+    fn add_var(&mut self) {
+        self.vars.push(Value::Nil);
+    }
+
+    fn push_call_frame(&mut self, num_args: usize) {
+        let top = self.stack.len();
+        let call = &self.stack[top - num_args as usize - 1];
+        self.calls.push(call.clone());
+        self.calls.set_fp(top - num_args as usize - 1);
+        self.calls.clear_pc();
+    }
+
+    fn pop_call_frame(&mut self, mut fp: usize) -> usize {
+        self.stack.resize(fp + 1, Value::Nil);
+
+        if let Some(new_top) = self.calls.next_from_top() {
+            fp = new_top.fp;
+        } else if let Some(new_top) = self.calls.top() {
+            fp = new_top.fp;
+        }
+        self.calls.pop();
+        fp
+    }
+
+    fn check_arity(&self, fun: &Value, num_args: usize) -> Result<usize, String> {
+        let top = self.stack.len();
+        let mut arity = 0;
+        match fun {
+            Value::Closure(c) => {
+                arity = c.get_arity();
+            }
+            _ => {
+                return Err(format!("not a function type, but {}", fun.value_type()));
+            }
+        }
+        if num_args != arity {
+            Err(format!("{} args expected, found {}", arity, num_args))
+        } else {
+            Ok(num_args)
+        }
+    }
+
+    fn call_value(&mut self, num_args: usize, debug: bool, gc: &Gc) -> Result<Value, String> {
+        let fun_index = self.stack.len() - (num_args as usize) - 1;
+        let fun = &self.stack[fun_index];
+        let args = &self.stack[fun_index..fun_index + (num_args as usize) + 1];
+        match self.check_arity(fun, num_args) {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(e);
+            }
+        }
+        match fun {
+            Value::Closure(_) => self.call_closure(num_args, gc, debug),
+            _ => Err(format!("not a function type, but {}", fun.value_type())),
+        }
+    }
+
+    #[allow(unused_assignments)]
+    fn call_closure(&mut self, num_args: usize, gc: &Gc, debug: bool) -> Result<Value, String> {
+        let mut pc = 0usize;
+
+        if let Some(counter) = self.get_pc() {
+            pc = counter;
+        } else {
+            panic!("no functions on call stack");
+        }
+        /*if debug {
+            return call_closure_debug(self, u8, gc);
+        }*/
+
+        self.push_call_frame(num_args);
+
+        let mut result = Ok(Value::Nil);
+        let mut curr_byte = 0u8;
+        let _sp = self.get_sp();
+        let mut fp = self.get_fp();
+        let mut closure: Managed<Closure> = self.stack[fp].as_closure();
+        let fc = closure.get_core();
+        let code: &[u8] = fc.get_code();
+
+        let _sp = 0usize;
+        while pc < fc.len() && result == Ok(Value::Nil) {
+            closure = self.stack[fp].as_closure();
+            fp = self.calls.get_fp();
+
+            read_byte!(pc, code, byte);
+            curr_byte = byte;
+
+            let opcode = OpCode::from(curr_byte);
+
+            #[cfg(feature = "debug_opcode")]
+            {
+                println!("Opcode {}:", opcode);
+            }
+            #[cfg(feature = "debug_vars")]
+            {
+                println!("");
+                self.debug_vars();
+            }
+            #[cfg(feature = "debug_stack")]
+            {
+                println!("");
+                self.debug_stack(fp);
+            }
+
+            result = match opcode {
+                OpCode::PushN => {
+                    read_byte!(pc, code, arg);
+                    for _i in 0..arg {
+                        self.stack.push(Value::Nil);
+                    }
+
+                    Ok(Value::Nil)
+                }
+                OpCode::Pop => {
+                    self.stack_pop();
+                    Ok(Value::Nil)
+                }
+                OpCode::PopN => {
+                    read_byte!(pc, code, arg);
+                    for _i in 0..arg {
+                        self.stack_pop();
+                    }
+
+                    Ok(Value::Nil)
+                }
+                OpCode::Dup => {
+                    let last = self.get_stack_top();
+                    if let Some(i) = last {
+                        self.stack.push(i.clone());
+                    } else {
+                        panic!("accessed stack from out of bounds");
+                    }
+                    Ok(Value::Nil)
+                }
+                OpCode::LoadTrue => {
+                    self.stack.push(Value::Bool(true));
+                    Ok(Value::Nil)
+                }
+                OpCode::LoadFalse => {
+                    self.stack.push(Value::Bool(false));
+                    Ok(Value::Nil)
+                }
+                OpCode::LoadNil => {
+                    self.stack.push(Value::Nil);
+                    Ok(Value::Nil)
+                }
+                OpCode::Load0
+                | OpCode::Load1
+                | OpCode::Load2
+                | OpCode::Load3
+                | OpCode::Load4
+                | OpCode::Load5
+                | OpCode::Load6
+                | OpCode::Load7
+                | OpCode::Load8
+                | OpCode::Load9
+                | OpCode::Load10 => {
+                    self.stack.push(Value::Int(
+                        (u8::from(opcode) - (u8::from(OpCode::Load0))) as i64,
+                    ));
+                    Ok(Value::Nil)
+                }
+                OpCode::LoadValue => {
+                    read_word!(pc, code, arg);
+                    self.stack
+                        .push(closure.get_core().get_constants()[arg as usize].clone());
+                    Ok(Value::Nil)
+                }
+                OpCode::Array => Ok(Value::Nil),
+                OpCode::Dict => Ok(Value::Nil),
+                OpCode::DefVar => {
+                    read_word!(pc, code, index);
+                    let top = self.get_stack_top();
+
+                    if let Some(val) = top {
+                        self.set_var(index as usize, val);
+                    } else {
+                        panic!("stack is empty");
+                    }
+                    Ok(Value::Nil)
+                }
+                OpCode::LoadVar => {
+                    read_word!(pc, code, arg);
+                    let elem = self.get_var(arg as usize).clone();
+                    if let Some(val) = elem {
+                        self.stack.push(val);
+                    } else {
+                        panic!(
+                            "var index out of range: {}; limit: {}",
+                            arg,
+                            self.vars.len()
+                        );
+                    }
+
+                    Ok(Value::Nil)
+                }
+                OpCode::StoreVar => {
+                    read_word!(pc, code, arg);
+                    if let Some(j) = self.get_stack_top() {
+                        self.set_var(arg as usize, j.clone());
+                    }
+                    Ok(Value::Nil)
+                }
+                OpCode::LoadLocal => Ok(Value::Nil),
+                OpCode::LoadLocal0 => Ok(Value::Nil),
+                OpCode::LoadLocal1 => Ok(Value::Nil),
+                OpCode::LoadLocal2 => Ok(Value::Nil),
+                OpCode::LoadLocal3 => Ok(Value::Nil),
+                OpCode::LoadLocal4 => Ok(Value::Nil),
+                OpCode::LoadLocal5 => Ok(Value::Nil),
+                OpCode::LoadLocal6 => Ok(Value::Nil),
+                OpCode::LoadLocal7 => Ok(Value::Nil),
+                OpCode::LoadLocal8 => Ok(Value::Nil),
+                OpCode::StoreLocal => Ok(Value::Nil),
+                OpCode::StoreLocal0 => Ok(Value::Nil),
+                OpCode::StoreLocal1 => Ok(Value::Nil),
+                OpCode::StoreLocal2 => Ok(Value::Nil),
+                OpCode::StoreLocal3 => Ok(Value::Nil),
+                OpCode::StoreLocal4 => Ok(Value::Nil),
+                OpCode::StoreLocal5 => Ok(Value::Nil),
+                OpCode::StoreLocal6 => Ok(Value::Nil),
+                OpCode::StoreLocal7 => Ok(Value::Nil),
+                OpCode::StoreLocal8 => Ok(Value::Nil),
+                OpCode::LoadUpvalue => Ok(Value::Nil),
+                OpCode::StoreUpvalue => Ok(Value::Nil),
+                OpCode::LoadField => Ok(Value::Nil),
+                OpCode::StoreField => Ok(Value::Nil),
+                OpCode::LoadStatic => Ok(Value::Nil),
+                OpCode::StoreStatic => Ok(Value::Nil),
+                OpCode::LoadMethod => Ok(Value::Nil),
+                OpCode::LoadStaticMethod => Ok(Value::Nil),
+                OpCode::LoadSuperMethod => Ok(Value::Nil),
+                OpCode::JumpFwd => {
+                    read_word!(pc, code, arg);
+                    pc += arg as usize;
+                    Ok(Value::Nil)
+                }
+                OpCode::JumpBack => {
+                    read_word!(pc, code, arg);
+                    pc -= arg as usize;
+                    Ok(Value::Nil)
+                }
+                OpCode::JumpTrue => {
+                    read_word!(pc, code, arg);
+                    let val = self.get_stack_top();
+                    if let Some(i) = val {
+                        if !is_none(i.clone()) {
+                            pc += arg as usize;
+                        }
+                    }
+                    Ok(Value::Nil)
+                }
+                OpCode::JumpFalse => {
+                    read_word!(pc, code, arg);
+                    let val = self.get_stack_top();
+                    if let Some(i) = val {
+                        if is_none(i.clone()) {
+                            pc += arg as usize;
+                        }
+                    }
+                    Ok(Value::Nil)
+                }
+                OpCode::DefStatic => Ok(Value::Nil),
+                OpCode::Method => Ok(Value::Nil),
+                OpCode::StaticMethod => Ok(Value::Nil),
+                OpCode::Instance => Ok(Value::Nil),
+                OpCode::Closure => Ok(Value::Nil),
+                OpCode::CloseUpvalue => Ok(Value::Nil),
+                OpCode::Call => {
+                    read_byte!(pc, code, num_args);
+                    println!("num_args = {}", num_args);
+
+                    match self.call_value((num_args as usize) + 1, debug, gc) {
+                        Ok(ref res) => {
+                            let top = self.stack.len();
+                            self.stack[top - (num_args as usize) - 1] = res.clone();
+                            Ok(res.clone())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                OpCode::Return => {
+                    if let Some(val) = self.calls.top() {
+                        fp = val.fp;
+                    } else {
+                        panic!("no calls left on the call stack");
+                    }
+
+                    let top = self.stack.len();
+                    let last = self.stack[top - 1].clone();
+                    self.stack[fp] = last.clone();
+                    fp = self.pop_call_frame(fp);
+
+                    Ok(last.clone())
+                }
+                OpCode::Ternary => Ok(Value::Nil),
+                OpCode::Neg => {
+                    if let Some(i) = self.get_stack_top() {
+                        match i {
+                            Value::Int(int) => {
+                                let val: Value = Value::Int(-int);
+                                let mut elem = self.get_stack_top();
+                                if let Some(ref mut e) = elem {
+                                    *e = val;
+                                } else {
+                                    panic!("stack is empty");
+                                }
+                                Ok(Value::Nil)
+                            }
+                            Value::Float(float) => {
+                                let val: Value = Value::Float(-float);
+                                let mut elem = self.get_stack_top();
+                                if let Some(ref mut e) = elem {
+                                    *e = val;
+                                } else {
+                                    panic!("stack is empty");
+                                }
+                                Ok(Value::Nil)
+                            }
+                            _ => Err("cannot negate value".to_string()),
+                        }
+                    } else {
+                        panic!("stack is empty");
+                    }
+                }
+                OpCode::Print => {
+                    if let Some(val) = self.get_stack_top() {
+                        print!("{}", val);
+                    } else {
+                        panic!("stack is empty");
+                    }
+                    Ok(Value::Nil)
+                }
+                OpCode::Println => {
+                    if let Some(val) = self.get_stack_top() {
+                        println!("{}", val);
+                    } else {
+                        panic!("stack is empty");
+                    }
+                    Ok(Value::Nil)
+                }
+                OpCode::Input => Ok(Value::Nil),
+                OpCode::MathOp => {
+                    read_byte!(pc, code, arg);
+                    self.execute_math_op(MathOp::from(arg), gc)
+                }
+                OpCode::MathAssignOp => Ok(Value::Nil),
+                OpCode::BitwiseOp => Ok(Value::Nil),
+                OpCode::BitwiseAssignOp => Ok(Value::Nil),
+                OpCode::Invalid => {
+                    panic!("{}", "invalid instruction".to_string());
+                }
+            };
+        }
+
+        match result {
+            Ok(ref res) => {
+                let top = self.stack.len();
+                self.stack[top - (num_args as usize) - 1] = res.clone();
+                Ok(res.clone())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /*fn call_closure_debug
+        (
+        &mut self,
+        num_args: u8,
+        gc: &Gc,
+    )
+        {
+        self.push_call_frame(num_args);
+
+        let mut result = Ok(Value::Nil);
+        let mut curr_byte = 0u8;
+        let _sp = self.get_sp();
+        let mut fp = self.get_fp();
+        let mut closure: Managed<Closure> = self.stack[fp].as_closure();
+        let fc = closure.get_core();
+        let code: &[u8] = fc.get_code();
+
+
+        let _sp = 0usize;
+
+        let mut debugger = Debugger::new();
+        while pc < fc.len() && result == Ok(Value::Nil) {
+        read_byte!(pc, code, byte);
+
+        let opcode = OpCode::from(byte);
+
+        let mut command = debugger.get_command() {
+
+        result = match opcode {
+        OpCode::PushN => {
+        read_byte!(pc, code, arg);
+        for _i in 0..arg {
+        self.stack.push(Value::Nil);
+    }
+
+        Ok(Value::Nil)
+    },
+        OpCode::Pop => {
+        self.stack_pop();
+        Ok(Value::Nil)
+    },
+        OpCode::PopN => {
+        read_byte!(pc, code, arg);
+        for _i in 0..arg {
+        self.stack_pop();
+    }
+
+        Ok(Value::Nil)
+    },
+        OpCode::Dup => {
+        let last = self.get_stack_top();
+        if let Some(i) = last {
+        self.stack.push(i.clone());
+    } else {
+        panic!("accessed stack from out of bounds");
+    }
+        Ok(Value::Nil)
+    },
+        OpCode::LoadTrue => {
+        self.stack.push(Value::Bool(true));
+        Ok(Value::Nil)
+    },
+        OpCode::LoadFalse => {
+        self.stack.push(Value::Bool(false));
+        Ok(Value::Nil)
+    },
+        OpCode::LoadNil => {
+        self.stack.push(Value::Nil);
+        Ok(Value::Nil)
+    },
+        OpCode::Load0 |
+        OpCode::Load1 |
+        OpCode::Load2 |
+        OpCode::Load3 |
+        OpCode::Load4 |
+        OpCode::Load5 |
+        OpCode::Load6 |
+        OpCode::Load7 |
+        OpCode::Load8 |
+        OpCode::Load9 |
+        OpCode::Load10 => {
+        self.stack.push(Value::Int((u8::from(opcode) - (u8::from(OpCode::Load0))) as i64));
+        Ok(Value::Nil)
+    },
+        OpCode::LoadValue => {
+        read_word!(pc, code, arg);
+        self.stack.push(closure.get_core().get_constants()[arg as usize].clone());
+        Ok(Value::Nil)
+    },
+        OpCode::Array => {
+        Ok(Value::Nil)
+    },
+        OpCode::Dict => {
+        Ok(Value::Nil)
+    },
+        OpCode::DefVar => {
+        read_word!(pc, code, arg);
+        let top = self.get_stack_top();
+
+        if let Some(val) = top {
+        self.add_var(val);
+    } else {
+        panic!("stack is empty");
+    }
+        Ok(Value::Nil)
+    },
+        OpCode::LoadVar => {
+        read_word!(pc, code, arg);
+        let elem = self.get_var(arg as usize).clone();
+        if let Some(val) = elem {
+        self.stack.push(val);
+    } else {
+        unreachable!();
+    }
+
+        Ok(Value::Nil)
+    },
+        OpCode::StoreVar => {
+        read_word!(pc, code, arg);
+        if let Some(j) = self.get_stack_top() {
+        self.set_var(arg as usize, j.clone());
+    }
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal0 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal1 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal2 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal3 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal4 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal5 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal6 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal7 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadLocal8 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal0 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal1 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal2 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal3 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal4 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal5 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal6 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal7 => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreLocal8 => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadUpvalue => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreUpvalue => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadField => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreField => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadStatic => {
+        Ok(Value::Nil)
+    },
+        OpCode::StoreStatic => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadMethod => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadStaticMethod => {
+        Ok(Value::Nil)
+    },
+        OpCode::LoadSuperMethod => {
+        Ok(Value::Nil)
+    },
+        OpCode::JumpFwd => {
+        read_word!(pc, code, arg);
+        pc += arg as usize;
+        Ok(Value::Nil)
+    },
+        OpCode::JumpBack => {
+        read_word!(pc, code, arg);
+        pc -= arg as usize;
+        Ok(Value::Nil)
+    },
+        OpCode::JumpTrue => {
+        read_word!(pc, code, arg);
+        let val = self.get_stack_top();
+        if let Some(i) = val {
+        if !is_none(i.clone()) {
+        pc += arg as usize;
+    }
+    }
+        Ok(Value::Nil)
+    },
+        OpCode::JumpFalse => {
+        read_word!(pc, code, arg);
+        let val = self.get_stack_top();
+        if let Some(i) = val {
+        if is_none(i.clone()) {
+        pc += arg as usize;
+    }
+    }
+        Ok(Value::Nil)
+    },
+        OpCode::DefStatic => {
+        Ok(Value::Nil)
+    },
+        OpCode::Method => {
+        Ok(Value::Nil)
+    },
+        OpCode::StaticMethod => {
+        Ok(Value::Nil)
+    },
+        OpCode::Instance => {
+        Ok(Value::Nil)
+    },
+        OpCode::Closure => {
+        Ok(Value::Nil)
+    },
+        OpCode::CloseUpvalue => {
+        Ok(Value::Nil)
+    },
+        OpCode::Call => {
+        read_byte!(pc, code, num_args);
+        println!("num_args = {}", num_args);
+
+
+        match self.call_value(num_args, debug, gc) {
+        Ok(ref res) => {
+        let top = self.stack.len();
+        self.stack[top - (num_args as usize) - 1] = res.clone();
+        Ok(res.clone())
+    },
+        Err(e) => {
+        Err(e)
+    },
+    }
+    },
+        OpCode::Return => {
+        if let Some(val) = self.calls.top() {
+        fp = val.fp;
+    } else {
+        panic!("no calls left on the call stack");
+    }
+        let
+        let top = self.stack.len();
+        let last = self.stack[top - 1].clone();
+        self.stack[fp] = last.clone();
+        fp = self.pop_call_frame(fp);
+
+        Ok(last.clone())
+    },
+        OpCode::Ternary => {
+        Ok(Value::Nil)
+    },
+        OpCode::Neg => {
+        if let Some(i) = self.get_stack_top() {
+        match i {
+        Value::Int(int) => {
+        let val: Value = Value::Int(-int);
+        let mut elem = self.get_stack_top();
+        if let Some(ref mut e) = elem {
+         *e = val;
+    } else {
+        panic!("stack is empty");
+    }
+        Ok(Value::Nil)
+    },
+        Value::Float(float) => {
+        let val: Value = Value::Float(-float);
+        let mut elem = self.get_stack_top();
+        if let Some(ref mut e) = elem {
+         *e = val;
+    } else {
+        panic!("stack is empty");
+    }
+        Ok(Value::Nil)
+    },
+        _ => Err("cannot negate value".to_string())
+    }
+    } else {
+        panic!("stack is empty");
+    }
+    },
+        OpCode::Print => {
+        if let Some(val) = self.get_stack_top() {
+        print!("{}", val);
+    } else {
+        panic!("stack is empty");
+    }
+        Ok(Value::Nil)
+    },
+        OpCode::Println => {
+        if let Some(val) = self.get_stack_top() {
+        println!("{}", val);
+    } else {
+        panic!("stack is empty");
+    }
+        Ok(Value::Nil)
+    },
+        OpCode::Input => {
+        Ok(Value::Nil)
+    },
+        OpCode::MathOp => {
+        read_byte!(pc, code, arg);
+        self.execute_math_op(MathOp::from(arg), gc)
+    },
+        OpCode::MathAssignOp => {
+        Ok(Value::Nil)
+    },
+        OpCode::BitwiseOp => {
+        Ok(Value::Nil)
+    },
+        OpCode::BitwiseAssignOp => {
+        Ok(Value::Nil)
+    },
+        OpCode::Invalid => {
+        panic!("{}", "invalid instruction".to_string());
+    }
+    };
+    }
+
+        match result {
+        Ok(ref res) => {
+        let top = self.stack.len();
+        self.stack[top - (num_args as usize) - 1] = res.clone();
+        Ok(res.clone())
+    },
+        Err(e) => {
+        Err(e)
+    },
+    }
+    }*/
+
+    fn debug_vars(&self) {
+        print!("NS Vars: [");
+        for i in 0..self.vars.len() {
+            print!("[{}]", self.vars[i]);
+        }
+        println!("]");
+    }
+    fn debug_stack(&self, fp: usize) {
+        print!("[");
+        for i in 0..self.stack.len() {
+            print!("[");
+            if i == fp {
+                print!("> ");
+            }
+            print!("{}", self.stack[i]);
+            if i == fp {
+                print!(" <");
+            }
+            print!("]");
+        }
+        println!("]");
+    }
+
+    fn execute_math_op(&mut self, op: MathOp, gc: &Gc) -> Result<Value, String> {
+        match op {
+            MathOp::Add => self.execute_add(gc),
+            MathOp::Subtract => self.execute_subtract(gc),
+            MathOp::Multiply => self.execute_multiply(gc),
+            MathOp::Divide => self.execute_divide(gc),
+            MathOp::Modulo => self.execute_modulo(gc),
+            MathOp::Power => self.execute_power(gc),
+            _ => {
+                panic!("invalid math operator");
+            }
+        }
+    }
+
+    fn execute_math_assign_op(&mut self, op: MathOp, gc: &Gc) -> Result<Value, String> {
+        match op {
+            MathOp::Add => self.execute_add_assign(gc),
+            MathOp::Subtract => self.execute_subtract_assign(gc),
+            MathOp::Multiply => self.execute_multiply_assign(gc),
+            MathOp::Divide => self.execute_divide_assign(gc),
+            MathOp::Modulo => self.execute_modulo_assign(gc),
+            MathOp::Power => self.execute_power_assign(gc),
+            _ => {
+                panic!("invalid compound assignment operator");
+            }
+        }
+    }
+
+    fn execute_add(&mut self, gc: &Gc) -> Result<Value, String> {
+        let arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(val1) => match arg2 {
+                Value::Int(val2) => {
+                    arg1 = Value::Int(val1 + val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(val1) => match arg2 {
+                Value::Float(val2) => {
+                    arg1 = Value::Float(val1 + val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::String(val1) => match arg2 {
+                Value::String(val2) => {
+                    arg1 = Value::String(gc.manage(format!("{}{}", *val1, *val2), &NO_GC));
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "+: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_subtract(&mut self, _gc: &Gc) -> Result<Value, String> {
+        let arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(val1) => match arg2 {
+                Value::Int(val2) => {
+                    arg1 = Value::Int(val1 - val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(val1) => match arg2 {
+                Value::Float(val2) => {
+                    arg1 = Value::Float(val1 - val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "-: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_multiply(&mut self, gc: &Gc) -> Result<Value, String> {
+        let arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(val1) => match arg2 {
+                Value::Int(val2) => {
+                    arg1 = Value::Int(val1 * val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(val1) => match arg2 {
+                Value::Float(val2) => {
+                    arg1 = Value::Float(val1 * val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::String(val1) => match arg2 {
+                Value::Int(val2) => {
+                    arg1 = Value::String(gc.manage(val1.repeat(val2 as usize), &NO_GC));
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "*: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_divide(&mut self, _gc: &Gc) -> Result<Value, String> {
+        let arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(val1) => match arg2 {
+                Value::Int(val2) => {
+                    if val2 <= 0 {
+                        return Err(String::from("division by zero"));
+                    }
+                    arg1 = Value::Int(val1 / val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(val1) => match arg2 {
+                Value::Float(val2) => {
+                    if val2 <= OrderedFloat(0.0) {
+                        return Err(String::from("division by zero"));
+                    }
+                    arg1 = Value::Float(val1 / val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "/: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_modulo(&mut self, _gc: &Gc) -> Result<Value, String> {
+        let arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(val1) => match arg2 {
+                Value::Int(val2) => {
+                    if val2 <= 0 {
+                        return Err(String::from("modulo by zero"));
+                    }
+                    arg1 = Value::Int(val1 / val2);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "/: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_power(&mut self, _gc: &Gc) -> Result<Value, String> {
+        let arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(val1) => match arg2 {
+                Value::Int(val2) => {
+                    arg1 = Value::Int(val1.pow(val2 as u32));
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(val1) => match arg2 {
+                Value::Float(val2) => {
+                    arg1 = Value::Float(val1.pow(val2));
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "**: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    // compound assignment math operators
+    fn execute_add_assign(&mut self, gc: &Gc) -> Result<Value, String> {
+        let mut arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(ref mut val1) => match arg2 {
+                Value::Int(ref mut val2) => {
+                    *val1 += *val2;
+                    arg1 = Value::Int(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(ref mut val1) => match arg2 {
+                Value::Float(ref mut val2) => {
+                    *val1 += *val2;
+                    arg1 = Value::Float(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::String(ref mut val1) => match arg2 {
+                Value::String(ref mut val2) => {
+                    **val1 = format!("{}{}", **val1, **val2);
+                    arg1 = Value::String(gc.manage(val1.to_string(), &NO_GC));
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "+=: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_subtract_assign(&mut self, _gc: &Gc) -> Result<Value, String> {
+        let mut arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(ref mut val1) => match arg2 {
+                Value::Int(ref mut val2) => {
+                    *val1 -= *val2;
+                    arg1 = Value::Int(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(ref mut val1) => match arg2 {
+                Value::Float(ref mut val2) => {
+                    *val1 -= *val2;
+                    arg1 = Value::Float(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "-=: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_multiply_assign(&mut self, gc: &Gc) -> Result<Value, String> {
+        let mut arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(ref mut val1) => match arg2 {
+                Value::Int(ref mut val2) => {
+                    *val1 *= *val2;
+                    arg1 = Value::Int(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(ref mut val1) => match arg2 {
+                Value::Float(val2) => {
+                    *val1 *= *val2;
+                    arg1 = Value::Float(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::String(ref mut val1) => match arg2 {
+                Value::Int(ref mut val2) => {
+                    **val1 = val1.repeat(*val2 as usize);
+                    arg1 = Value::String(gc.manage(val1.clone().to_string(), &NO_GC));
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "*=: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_divide_assign(&mut self, _gc: &Gc) -> Result<Value, String> {
+        let mut arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(ref mut val1) => match arg2 {
+                Value::Int(ref mut val2) => {
+                    if *val2 <= 0 {
+                        return Err(String::from("division by zero"));
+                    }
+                    *val1 /= *val2;
+                    arg1 = Value::Int(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(ref mut val1) => match arg2 {
+                Value::Float(ref mut val2) => {
+                    if *val2 <= OrderedFloat(0.0) {
+                        return Err(String::from("division by zero"));
+                    }
+                    *val1 /= *val2;
+                    arg1 = Value::Float(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "/=: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_modulo_assign(&mut self, _gc: &Gc) -> Result<Value, String> {
+        let mut arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(ref mut val1) => match arg2 {
+                Value::Int(ref mut val2) => {
+                    if *val2 <= 0 {
+                        return Err(String::from("modulo by zero"));
+                    }
+                    *val1 %= *val2;
+                    arg1 = Value::Int(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "%=: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute_power_assign(&mut self, _gc: &Gc) -> Result<Value, String> {
+        let mut arg2 = self.stack.pop().unwrap();
+        let mut arg1 = self.stack.pop().unwrap();
+
+        match arg1 {
+            Value::Int(ref mut val1) => match arg2 {
+                Value::Int(ref mut val2) => {
+                    arg1 = Value::Int(val1.pow(val1.pow(*val2 as u32) as u32));
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            Value::Float(ref mut val1) => match arg2 {
+                Value::Float(ref mut val2) => {
+                    *val1 = val1.pow(*val2);
+                    arg1 = Value::Float(*val1);
+                    self.stack.push(arg1.clone());
+                    return Ok(arg1);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Err(format!(
+            "**=: invalid operands {} and {}",
+            arg1.value_type(),
+            arg2.value_type()
+        ))
+    }
+
+    fn execute(
+        &mut self,
+        compiler: &Compiler,
+        gc: &Gc,
+        debug: bool,
+        compile: bool,
+    ) -> Result<Value, InterpretErrorType> {
+        self.calls.clear();
+        self.stack.clear();
+        let closure = compiler.get_main();
+
+        if let Some(f) = closure {
+            self.main_fun = closure;
+        } else if compile {
+            let mut result: bool = false;
+            result = compiler.compile_to_c();
+            if !result {
+                eprintln("C compile to file {} failed", compiler.c_file());
+                return Err(InterpretErrorType::CompileTimeError);
+            } else {
+                eprintln("C compile complete!");
+                return Ok(Value::Nil)
+            }
+        } else {
+            return Err(InterpretErrorType::CompileTimeError);
+        }
+
+        // push main function onto the stack
+        self.stack.push(Value::Closure(closure));
+
+        self.push_call_frame(0usize);
+        let result = self.call_closure(0usize, gc, debug);
+        match result {
+            Ok(val) => {
+                return Ok(val);
+            },
+            Err(e) => {
+                println!(
+                    "\n\nRuntime error."
+                );
+                self.print_backtrace();
+                println!("Error: {}", e);
+                return Err(InterpretErrorType::RuntimeError);
+            }
+        } else {
+            return Err(InterpretErrorType::CompileTimeError);
+        }
+    }
+
+    pub(crate) fn run(
+        &mut self,
+        compiler: &Compiler,
+        gc: &Gc,
+        debug: bool,
+        compile: bool,
+    ) -> Result<Value, InterpretErrorType> {
+        self.execute(compiler, gc, debug, compile)
+    }
+
+    pub fn print_backtrace(&self) {
+        println!("{}", self.calls.get_backtrace());
+    }
+}
+
+
+
+
+
+
+
+#[derive(Clone)]
+struct Local {
+    name: String,
+    scope: usize,
+    upvalue: bool,
+    defined: bool,
+}
+
+impl Local {
+    fn new(name: String, scope: usize, upvalue: bool) -> Self {
+        Self {
+            name,
+            scope,
+            upvalue,
+            defined: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Upvalue {
+    local: bool,
+    index: usize,
+}
+
+impl Upvalue {
+    fn new(local: bool, index: usize) -> Self {
+        Self { local, index }
+    }
+}
+
+#[derive(Clone)]
+struct FunCompiler {
+    name: String,
+    ty: FunctionType,
+    scope: usize,
+    arity: usize,
+
+    locals: Vec<Local>,
+    upvalues: Vec<Upvalue>,
+    code: Vec<u8>,
+    constants: HashMap<Value, usize>,
+    constant_arr: Vec<Value>,
+    local_fun_symtab: HashMap<String, VarInfo>,
+    closure: Option<Managed<Closure>>,
+}
+
+
+
+
+
+#[derive(Clone, PartialEq)]
+enum VarType {
+    Var,
+    Function,
+    NamedClosure,
+    AnonClosure,
+    Constructor,
+    Method,
+    Class,
+    Const,
+}
+
+#[derive(Clone, PartialEq)]
+enum ScopeType {
+    Ns,
+    Local,
+    Upvalue,
+}
+
+#[derive(Clone, PartialEq)]
+enum VarErrorType {
+    Undefined,
+    AlreadyExists,
+    TooMany,
+    SelfInit,
+    IsFunction,
+    Other,
+}
+
+
+
+#[derive(Clone)]
+struct VarError {
+    name: String,
+    error_type: VarErrorType,
+}
+
+impl VarError {
+    fn new(name: String, error_type: VarErrorType) -> Self {
+        Self { name, error_type }
+    }
+
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn get_error_type(&self) -> VarErrorType {
+        self.error_type.clone()
+    }
+}
+
+#[cfg(test)]
+
+mod tests {
+    use super::*;
+    use crate::gc::{Gc, NO_GC};
+    use crate::parser::interpret_string;
+
+    #[test]
+    fn test_add_ns_var() {
+        let mut deps = prep_for_test();
+
+        let mut code = "let var = 10;";
+        let mut result = interpret_string(
+            &mut code.to_string(),
+            &mut deps.0,
+            &mut deps.1,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(result, Ok(Value::Nil));
+
+        code = "var;";
+        result = interpret_string(
+            &mut code.to_string(),
+            &mut deps.0,
+            &mut deps.1,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(result, Ok(Value::Int(10)));
+    }
+
+    fn prep_for_test() -> (VM, Gc) {
+        (VM::new(), Gc::new())
+    }
 }

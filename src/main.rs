@@ -25,11 +25,10 @@ pub mod prelude {
     pub use crate::token::*;
     pub use crate::upvalue::*;
     pub use crate::value::*;
-    pub use crate::vm::*;
 }
 
 use crate::gc::Gc;
-use crate::parser::{interpret_file, interpret_string, InterpretErrorType};
+use crate::parser::{Parser, InterpretErrorType};
 use crate::prelude::VM;
 use std::env;
 use std::io;
@@ -38,9 +37,7 @@ use std::process;
 //use crate::object::*;
 
 fn main() -> Result<(), String> {
-    let mut gc = Gc::new();
-    let mut vm = VM::new();
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = env::args().collect(); 
     let mut iter = args.iter();
     let mut arg = iter.next();
     arg = iter.next();
@@ -147,12 +144,7 @@ fn main() -> Result<(), String> {
         }
     }
 
-    let mut filename = String::from("");
-    if let Some(a) = arg {
-        filename = a.clone();
-    } else {
-        return repl(&mut vm, &mut gc, print_ast, compile, debug);
-    }
+    
 
     let mut rest: Vec<String> = vec![];
 
@@ -167,7 +159,15 @@ fn main() -> Result<(), String> {
         }
     }
 
-    let result = interpret_file(filename, &gc, debug);
+    let mut parser = Parser::new(debug);
+    let mut filename = String::from("");
+    if let Some(a) = arg {
+        filename = a.clone();
+    } else {
+        return repl(&parser, debug);
+    }
+    
+    let result = parser.parse_file(filename);
     match result {
         Ok(_) => {
             println!("");
@@ -195,7 +195,7 @@ fn main() -> Result<(), String> {
 }
 
 fn repl(
-    vm: &mut VM,
+    parser: &Parser,
     gc: &mut Gc,
     print_ast: bool,
     compile: bool,
@@ -210,7 +210,7 @@ fn repl(
             Ok(num) => {
                 if num == 2 && input.starts_with('.') {
                     input.clear();
-                    let result = interpret_string(&mut buf, gc, debug);
+                    let result = parser.interpret_text(&mut buf, gc, debug);
                     match result {
                         Ok(value) => {
                             println!("{}", value);
