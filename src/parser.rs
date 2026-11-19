@@ -13,6 +13,7 @@ pub(crate) const MAX_CONSTANTS: usize = 65536;
 pub(crate) const MAX_VARIABLES: usize = 65536;
 pub(crate) const MAX_FIELDS: usize = 256;
 pub(crate) const MAX_METHODS: usize = 65536;
+pub(crate) const MAX_MODULES: usize = 65536;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpretErrorType {
@@ -94,9 +95,9 @@ struct LexerData {
 }
 
 pub struct Parser <'a> {
-    compiler: Compiler,
-    vm: VM,
-    gc: Gc,
+    compiler: Box<Compiler>,
+    vm: Box<VM>,
+    gc: Box<Gc>,
     lexer_stack: Vec<LexerData>,
     error_count: usize,
     in_panic_mode: bool,
@@ -107,9 +108,9 @@ pub struct Parser <'a> {
 impl<'a> Parser {
     fn new(debug: bool, compile: bool) -> Self {
         let mut s = Self {
-            compiler: Compiler::new(),
-            vm: VM::new(),
-            gc: Gc::new(),
+            compiler: Box::new(Compiler::new()),
+            vm: Box::new(VM::new()),
+            gc: Box::new(Gc::new()),
             lexer_stack: vec![],
             in_panic_mode: false,
             in_panic_lock_mode: false,
@@ -227,7 +228,12 @@ impl<'a> Parser {
         s
     }
 
-    pub fn parse_text(&self, text: &mut String) -> Result<Value, InterpretErrorType> {
+    pub fn parse_text(
+    	&self, 
+    	text: &mut String,
+    	debug: bool,
+    	compile: bool
+    ) -> Result<Value, InterpretErrorType> {
         self.lexer_stack = vec![];
         self.error_count = 0;
         self.in_panic_mode = false;
@@ -259,10 +265,14 @@ impl<'a> Parser {
         if !self.parse(self.gc) {
             Err(InterpretErrorType::ParseError)
         } else {
-            vm.run(&mut root, gc, debug, compile)
+            vm.run(&mut root, debug, compile)
         }
     }
-    pub fn parse_file(&self, fname: String) -> Result<Value, InterpretErrorType> {
+    pub fn parse_file(
+    	&self, 
+    	fname: String
+    	debug: bool,
+    	compile: bool) -> Result<Value, InterpretErrorType> {
         self.lexer_stack = vec![];
         self.error_count = 0;
         self.in_panic_mode = false;
@@ -297,17 +307,22 @@ impl<'a> Parser {
         if !self.parse(self.gc) {
             Err(InterpretErrorType::ParseError)
         } else {
-            vm.run(gc, debug, compile)
+            vm.run(self.gc, debug, compile)
         }
     }
 
 
-    fn advance(&mut self, gc: &Gc) {
+    fn advance(&mut self, gc: Box<Gc>) {
         self.lexer_stack.last_mut().unwrap().prev =
             self.lexer_stack.last_mut().unwrap().curr.clone();
         loop {
-            self.lexer_stack.last_mut().unwrap().curr =
-                *self.lexer_stack.last_mut().unwrap().scan(gc);
+        	self.lexer_stack.last_mut().unwrap().curr =
+        	match self.lexer_stack.last_mut().unwrap().lexer {
+        		None,
+        		Some(l) { l.scan_token(); }, 
+        	} 
+        	
+            
             if self.current().kind != TokenKind::Err {
                 break;
             }
@@ -320,7 +335,7 @@ impl<'a> Parser {
         self.current().kind == tk
     }
 
-    fn match_token(&mut self, tk: TokenKind, gc: &Gc) -> bool {
+    fn match_token(&mut self, tk: TokenKind, gc: Box<Gc>) -> bool {
         if self.current().kind != tk {
             return false;
         }
@@ -328,7 +343,7 @@ impl<'a> Parser {
         return true;
     }
 
-    fn consume(&mut self, tk: TokenKind, err_message: String, gc: &Gc) -> bool {
+    fn consume(&mut self, tk: TokenKind, err_message: String, gc: Box<Gc>) -> bool {
         if self.current().kind == tk {
             self.advance(gc);
             return true;
@@ -389,7 +404,7 @@ impl<'a> Parser {
     }
 
     // Entry point of parser
-    fn parse(&self, gc: &Gc) -> bool {
+    fn parse(&self, gc: Box<Gc>) -> bool {
         while self.current().kind != TokenKind::Done {
             let _ = self.current().kind;
             let left = self.parse_stmt(gc);
@@ -414,7 +429,7 @@ impl<'a> Parser {
     // Pratt Parser methods
 
     // Synchronizes the error system
-    fn synchronize_error(&mut self, gc: &Gc) {
+    fn synchronize_error(&mut self, gc: Box<Gc>) {
         self.in_panic_mode = false;
 
         while self.current().kind != TokenKind::Done {
@@ -440,7 +455,7 @@ impl<'a> Parser {
     }
 
     // Calls the corresponding statement function
-    fn call_stmt_fn(&mut self, tk: TokenKind, gc: &Gc) -> bool {
+    fn call_stmt_fn(&mut self, tk: TokenKind, gc: Box<Gc>) -> bool {
         match tk {
             TokenKind::LetKw => self.parse_let_stmt(gc),
             TokenKind::ReturnKw => self.parse_return_stmt(gc),
@@ -451,7 +466,7 @@ impl<'a> Parser {
     }
 
     // Calls the corresponding prefix function
-    fn call_prefix_fn(&mut self, gc: &Gc) -> bool {
+    fn call_prefix_fn(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         match tk {
             TokenKind::Int => self.parse_int(gc),
@@ -472,7 +487,7 @@ impl<'a> Parser {
     }
 
     // Calls the corresponding infix function
-    fn call_infix_fn(&mut self, gc: &Gc) -> bool {
+    fn call_infix_fn(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         match tk {
             TokenKind::Add => self.parse_addition(gc),
@@ -559,7 +574,7 @@ impl<'a> Parser {
         }
     }
 
-    fn parse_stmt(&mut self, gc: &Gc) -> bool {
+    fn parse_stmt(&mut self, gc: Box<Gc>) -> bool {
         let mut node = false;
         let tk = self.current().kind;
         let stmt = self.stmt_bp(tk.clone());
@@ -581,7 +596,7 @@ impl<'a> Parser {
         node
     }
 
-    fn parse_expr(&mut self, gc: &Gc, bp: BindingPower) -> bool {
+    fn parse_expr(&mut self, gc: Box<Gc>, bp: BindingPower) -> bool {
         let mut tk = self.current().kind;
         let prefix = self.prefix_bp(tk);
         if prefix.is_none() {
@@ -604,13 +619,13 @@ impl<'a> Parser {
             if infix.is_none() {
                 return l;
             }
-            l = self.call_infix_fn(l, gc);
+            l = self.call_infix_fn(gc);
         }
 
         l
     }
 
-    fn parse_let_stmt(&mut self, gc: &Gc) -> bool {
+    fn parse_let_stmt(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
         self.consume(
             TokenKind::Ident,
@@ -625,8 +640,8 @@ impl<'a> Parser {
             gc,
         );
 
-        let e = self.parse_expr(false, gc, BindingPower::Assignment);
-        if e.is_none() {
+        let e = self.parse_expr(gc, BindingPower::Assignment);
+        if !e {
             return false;
         }
 
@@ -641,11 +656,11 @@ impl<'a> Parser {
         }
     }
 
-    fn parse_const_stmt(&mut self, _gc: &Gc) -> bool {
+    fn parse_const_stmt(&mut self, _gc: Box<Gc>) -> bool {
         false
     }
 
-    fn parse_class_decl(&mut self, _gc: &Gc) -> bool {
+    fn parse_class_decl(&mut self, _gc: Box<Gc>) -> bool {
         false
     }
 
@@ -653,7 +668,7 @@ impl<'a> Parser {
         false
     }
 
-    fn parse_ns_decl(&mut self, _gc: &Gc) -> bool {
+    fn parse_ns_decl(&mut self, _gc: Box<Gc>) -> bool {
         false
     }
 
@@ -665,7 +680,7 @@ impl<'a> Parser {
 
     // IF Statement
 
-    fn parse_if_stmt(&mut self, gc: &Gc) -> bool{
+    fn parse_if_stmt(&mut self, gc: Box<Gc>) -> bool{
         self.advance(gc);
         let if_expr = self.parse_expr(gc, BindingPower::Assignment);
         if if_expr {
@@ -678,7 +693,7 @@ impl<'a> Parser {
 
     // prefix operators
 
-    fn parse_anon_closure(&mut self, gc: &Gc) -> bool {
+    fn parse_anon_closure(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
         let mut params: Vec<String> = vec![];
 
@@ -687,9 +702,11 @@ impl<'a> Parser {
                 if !self.consume(TokenKind::Ident, "parameter name expected".to_string(), gc) {
                     return false;
                 }
-                let param = Box::new(Ast::Variable {
-                    name: self.previous().lexeme.clone(),
-                    arity: false,
+                compiler.add_var
+                    (
+                        self.previous().lexeme.clone(),
+                        arity,        
+                    )
                 });
                 params.push(param);
 
@@ -733,7 +750,7 @@ impl<'a> Parser {
         }
     }
 
-    fn parse_named_closure(&mut self, gc: &Gc) -> bool {
+    fn parse_named_closure(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
         let mut params: Vec<String> = vec![];
 
@@ -803,14 +820,14 @@ impl<'a> Parser {
             self.advance(gc);
         }
 
-        let ret = if self.error_count > 0 {
+        if self.error_count > 0 {
             false
         } else {
             true
         } 
     }
 
-    fn parse_return_stmt(&mut self, gc: &Gc) -> bool {
+    fn parse_return_stmt(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
         if !self.match_token(TokenKind::Semicolon, gc) {
             let ret_expr = self.parse_expr(gc, BindingPower::Assignment);
@@ -832,7 +849,7 @@ impl<'a> Parser {
         false
     }
 
-    fn parse_block(&mut self, gc: &Gc) -> bool{
+    fn parse_block(&mut self, gc: Box<Gc>) -> bool{
         self.advance(gc);
 
         while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Done) {
@@ -854,7 +871,7 @@ impl<'a> Parser {
         }
     }
 
-    fn parse_expr_stmt(&mut self, gc: &Gc) -> bool {
+    fn parse_expr_stmt(&mut self, gc: Box<Gc>) -> bool {
         // generate expression nodes
         let node = self.parse_expr(gc, BindingPower::Assignment);
 
@@ -873,47 +890,47 @@ impl<'a> Parser {
         }
     }
 
-    fn parse_int(&mut self, gc: &Gc) -> bool {
+    fn parse_int(&mut self, gc: Box<Gc>) -> bool {
         let v = self.current().value;
         self.advance(gc);
         true
     }
 
-    fn parse_float(&mut self, gc: &Gc) -> bool {
+    fn parse_float(&mut self, gc: Box<Gc>) -> bool {
         let v = self.current().value;
         self.advance(gc);
         true
     }
 
-    fn parse_var(&mut self, gc: &Gc) -> bool {
+    fn parse_var(&mut self, gc: Box<Gc>) -> bool {
         let name = self.current().lexeme;
         self.advance(gc);
         true
     }
 
-    fn parse_true(&mut self, gc: &Gc) -> bool {
+    fn parse_true(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
         true
     }
 
-    fn parse_false(&mut self, gc: &Gc) -> bool {
+    fn parse_false(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
         true
     }
 
-    fn parse_nil(&mut self, gc: &Gc) -> bool {
+    fn parse_nil(&mut self, gc: Box<Gc>) -> bool {
         let v = self.current().value;
         self.advance(gc);
         true
     }
 
-    fn parse_string(&mut self, gc: &Gc) -> bool {
+    fn parse_string(&mut self, gc: Box<Gc>) -> bool {
         let v = self.current().value;
         self.advance(gc);
         true
     }
 
-    fn parse_argument_list(&mut self, gc: &Gc) -> Option<Vec<String>> {
+    fn parse_argument_list(&mut self, gc: Box<Gc>) -> Option<Vec<String>> {
         let mut arg_list: Vec<String>> = vec![];
         if !self.check(TokenKind::RParen) {
             while !self.check(TokenKind::RParen) && !self.check(TokenKind::Done) {
@@ -939,41 +956,41 @@ impl<'a> Parser {
         Some(arg_list.clone());
     }
 
-    fn parse_function_call(&mut self, gc: &Gc) -> bool {
+    fn parse_function_call(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
         let arg_list = self.parse_argument_list(left.clone(), gc);
 
         if arg_list.is_none() {
-            false;
+            false
         } else {
             true
         }
     }
 
-    fn parse_positive(&mut self, gc: &Gc) -> bool {
+    fn parse_positive(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
         self.parse_expr(gc, BindingPower::Assignment)
     }
 
-    fn parse_negative(&mut self, gc: &Gc) -> bool {
+    fn parse_negative(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
 
         self.parse_expr(gc, BindingPower::Assignment)
     }
 
-    fn parse_lnot(&mut self, gc: &Gc) -> bool {
+    fn parse_lnot(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
 
-        self.parse_expr(gc, BindingPower::Assignment);
+        self.parse_expr(gc, BindingPower::Assignment)
     }
 
-    fn parse_not(&mut self, gc: &Gc) -> bool {
+    fn parse_not(&mut self, gc: Box<Gc>) -> bool {
         self.advance(gc);
 
         self.parse_expr(gc, BindingPower::Unary) 
     }
 
-    fn parse_addition(&mut self, gc: &Gc) -> bool {
+    fn parse_addition(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -986,14 +1003,14 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         } else {
             true
         }
     }
 
-    fn parse_subtraction(&mut self, gc: &Gc) -> bool {
+    fn parse_subtraction(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1006,14 +1023,14 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         } else {
             true
         }
     }
 
-    fn parse_multiplication(&mut self, gc: &Gc) -> bool {
+    fn parse_multiplication(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1026,14 +1043,14 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         } else {
             true
         }
     }
 
-    fn parse_division(&mut self, gc: &Gc) -> bool {
+    fn parse_division(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1046,14 +1063,14 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         } else {
             true
         }
     }
 
-    fn parse_modulo(&mut self, gc: &Gc) -> bool {
+    fn parse_modulo(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1066,14 +1083,14 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         } else {
             true
         }
     }
 
-    fn parse_power(&mut self, gc: &Gc) -> bool {
+    fn parse_power(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
 
@@ -1087,14 +1104,14 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         } else {
             true
         }
     }
 
-    fn parse_land(&mut self, gc: &Gc) -> bool {
+    fn parse_land(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1108,7 +1125,7 @@ impl<'a> Parser {
                 gc,
                 BindingPower::from(<BindingPower as Into<u8>>::into(bp.clone().unwrap()) + 1),
             );
-            if !right() {
+            if !right {
                 return false;
             }
             if bp.is_some() {
@@ -1117,7 +1134,7 @@ impl<'a> Parser {
         false
     }
 
-    fn parse_lor(&mut self, gc: &Gc) -> bool {
+    fn parse_lor(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         let mut right = false;
@@ -1145,7 +1162,7 @@ impl<'a> Parser {
                 gc,
                 BindingPower::from(<BindingPower as Into<u8>>::into(bp.clone().unwrap()) + 1),
             );
-            if !right() {
+            if !right {
                 return false;
             }
             if bp.is_some() {
@@ -1154,7 +1171,61 @@ impl<'a> Parser {
         false
     }
 
-    fn parse_and(&mut self, gc: &Gc) -> bool {
+    fn parse_and(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_or(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_xor(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            return false;
+        }
+    }
+
+    fn parse_lshift(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1172,7 +1243,7 @@ impl<'a> Parser {
         }
     }
 
-    fn parse_or(&mut self, gc: &Gc) -> bool {
+    fn parse_rshift(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1185,12 +1256,12 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         }
     }
 
-    fn parse_xor(&mut self, gc: &Gc) -> bool {
+    fn parse_compound_addition(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1203,66 +1274,138 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
-            return false;
-        }
-    }
-
-    fn parse_lshift(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_rshift(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_compound_addition(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
+        if !right {
             false;
         }
     }
 
-    fn parse_compound_subtraction(&mut self, gc: &Gc) -> bool {
+    fn parse_compound_subtraction(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_compound_multiplication(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_compound_division(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_compound_modulo(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_compound_power(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_compound_and(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_compound_or(&mut self, gc: Box<Gc>) -> bool {
+        let tk = self.current().kind;
+        let bp = self.infix_bp(tk);
+        if bp.is_none() {
+            return false;
+        }
+
+        self.advance(gc);
+
+        let right = self.parse_expr(
+            gc,
+            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
+        );
+        if !right {
+            false
+        }
+    }
+
+    fn parse_compound_xor(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1280,7 +1423,7 @@ impl<'a> Parser {
         }
     }
 
-    fn parse_compound_multiplication(&mut self, gc: &Gc) -> bool {
+    fn parse_compound_lshift(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1293,12 +1436,12 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         }
     }
 
-    fn parse_compound_division(&mut self, gc: &Gc) -> bool {
+    fn parse_compound_rshift(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1311,138 +1454,12 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
         );
-        if !right() {
+        if !right {
             false
         }
     }
 
-    fn parse_compound_modulo(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_compound_power(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_compound_and(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_compound_or(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_compound_xor(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_compound_lshift(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_compound_rshift(&mut self, gc: &Gc) -> bool {
-        let tk = self.current().kind;
-        let bp = self.infix_bp(tk);
-        if bp.is_none() {
-            return false;
-        }
-
-        self.advance(gc);
-
-        let right = self.parse_expr(
-            gc,
-            BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap()) + 1),
-        );
-        if !right() {
-            false
-        }
-    }
-
-    fn parse_assignment(&mut self, gc: &Gc) -> bool {
+    fn parse_assignment(&mut self, gc: Box<Gc>) -> bool {
         let tk = self.current().kind;
         let bp = self.infix_bp(tk);
         if bp.is_none() {
@@ -1456,7 +1473,7 @@ impl<'a> Parser {
             gc,
             BindingPower::from(<BindingPower as Into<u8>>::into(bp.unwrap() + 1)),
         );
-        if !right() {
+        if !right {
             return false;
         }
     }
@@ -1516,23 +1533,23 @@ impl Compiler {
     }
 
     #[inline]
-    fn register_mod(
+    fn register_module(
+    ) 
+    {
+    }
 
-
-    #[inline]
-    fn get_mod(
+    fn get_module(
         &self, 
         name: String
     ) -> Result<Module, String> {
         self.symbols.get_mod(self, name)
     }
 
-    #[inline]
     fn declare_fun(
         &self,
         mut name: String,
-        params: Vec<VarEntry>
-        parent: Option<Rc<FunEnv>>,
+        params: Vec<VarInfo>
+        parent: Option<Rc<FunCompiler>>,
         fun_type: FunctionType,
     ) -> Result<usize, String>
         
@@ -1552,18 +1569,18 @@ struct SymbolTables {
 
 impl SymbolTables {
     fn new() -> Self {
-        let mut self = Self {
+        let mut s = Self {
             mods: Modules::new(),
             calls: vec![],
         }
 
-        let _ = self.declare_fun(
+        let _ = s.declare_fun(
             " main".to_string(),
             vec![],
             None,
             FunctionType::Main,
         )
-        self
+        s
     }
 
     fn declare_mod(
@@ -1587,30 +1604,32 @@ impl SymbolTables {
     }
 
     fn declare_fun(
+    	&mut self,
         name: String, 
-        params: Vec<VarEntry>, 
-        parent: Option<Rc<FunEnv>>,
+        params: Vec<VarInfo>, 
+        parent: Option<Rc<FunCompiler>>,
         fun_type: FunctionType
     ) -> usize {
-        calls.push(FunEnv::new(
+        self.calls.push(FunCompiler::new(
             name,
             params,
             parent,
             fun_type,
         ))
-        calls.len()
+        self.calls.len()
     }
 
     fn declare_local(
         name: String,
         local_scope: usize,
         dist_from_top: usize,
-    ) -> VarEntry {
-        VarEntry::new(
+    ) -> VarInfo {
+        VarInfo::new(
             name,
             VarType::Function
             local_scope,
-
+        )
+	}
 }
 
 pub struct Modules {
@@ -1644,8 +1663,8 @@ impl Modules {
 struct Module {
     mod_name: String,
     mod_index: usize,
-    mod_parent: Option<Rc<Module>>,
-    mod_vars: HashMap<String, VarEntry>,
+    mod_parent: usize,
+    mod_vars: HashMap<String, VarInfo>,
 }
 
 impl Module {
@@ -1658,104 +1677,19 @@ impl Module {
             mod_name: name,
             mod_index: index,
             mod_parent: parent,
-            mod_vars: HashMap::<String, VarEntry>::new(),
+            mod_vars: HashMap::<String, VarInfo>::new(),
         }
     }
 
     fn declare_mod_var(
+    ) -> Result<VarInfo, VarError>
+    {
+    }
         
 }
 
-struct FunEnv {
-    locals: Rc<RefCell<HashMap<String, Option<VarEntry>>>>,
-    env_parent: Option<Rc<RefCell<FunEnv>>>,
-}
-
-impl FunEnv {
-    fn new(parent: Option<Rc<RefCell<FunEnv>>>) {
-        Self {
-            locals: Rc::new(RefCell::new(HashMap::new())),
-            env_parent: parent,
-        }
-    }
 
 
-}
-
-#[derive(Clone)]
-struct VarEntry {
-    name: String,
-    arity: Option<usize>,
-    var_type: VarType,
-    scope_type: ScopeType,
-    scope: usize,
-    index: usize,
-    upvalue_local_index: usize,
-    var_mod: Option<Rc<Module>>,
-}
-
-impl VarEntry {
-    fn new(
-        name: String,
-        arity: Option<usize>,
-        var_type: VarType,
-        scope_type: ScopeType,
-        scope: usize,
-        index: usize,
-        upvalue_local_index: usize,
-        var_mod: Option<Rc<Module>>,
-    ) -> Self {
-        Self {
-            name,
-            arity,
-            var_type,
-            scope_type,
-            scope,
-            index,
-            upvalue_local_index,
-        }
-    }
-}
-
-
-struct VarEntry {
-    name: String,
-    var_type: VarType,
-    var_index: usize,
-    var_scope: usize,
-    value: Value,
-    var_mod: Option<Rc<Module>>,
-}
-
-impl VarEntry {
-    pub fn new(
-        name: String, 
-        var_type: VarType,
-        dist_from_top: usize,
-        can_be_optimized: bool,
-        value: Option<Value>
-    ) -> Self {
-        Self {
-            name,
-            var_type,
-            dist_from_top,
-            true,
-            value,
-        }
-    }
-
-    pub fn get_name(&self) -> String {
-        self.name.clone()
-    }
-
-    pub fn get_type(&self) -> VarType {
-        self.var_type.clone()
-    }
-
-    pub fn get_value(&self) -> Option<Value> {
-        self.value.clone()
-    }
-}
 
 fn emit_var_load(&mut self, fc: &mut FunCompiler, var: VarInfo) {
     match var.scope_type {
@@ -1775,12 +1709,12 @@ fn emit_var_load(&mut self, fc: &mut FunCompiler, var: VarInfo) {
     }
 }
 
-fn emit_math_op<'a>(
+fn do_emit_math_op<'a>(
     &mut self,
     tk: TokenKind,
     l: &Value,
     r: &Value,
-    gc: &Gc,
+    gc: Box<Gc>,
 ) -> Option<Managed<Closure>> {
     match tk {
         TokenKind::Add {
@@ -1825,19 +1759,6 @@ fn emit_math_op<'a>(
     } else {
         panic!("current token kind is invalid");
     }
-}
-
-fn get_constant(&mut self, val: &Value) -> usize {
-    let len = self.constants.len();
-
-    let pair = self.constants.get_key_value(val);
-    if pair.is_none() {
-        self.constants.insert(val.clone(), self.constants.len());
-        self.constant_arr.push(val.clone());
-    } else {
-        return *pair.unwrap().1;
-    }
-    return len;
 }
 
 fn emit_op(&mut self, opcode: OpCode) {
@@ -2270,7 +2191,7 @@ impl VM {
         }
     }
 
-    fn call_value(&mut self, num_args: usize, debug: bool, gc: &Gc) -> Result<Value, String> {
+    fn call_value(&mut self, num_args: usize, debug: bool, gc: Box<Gc>) -> Result<Value, String> {
         let fun_index = self.stack.len() - (num_args as usize) - 1;
         let fun = &self.stack[fun_index];
         let args = &self.stack[fun_index..fun_index + (num_args as usize) + 1];
@@ -2287,7 +2208,7 @@ impl VM {
     }
 
     #[allow(unused_assignments)]
-    fn call_closure(&mut self, num_args: usize, gc: &Gc, debug: bool) -> Result<Value, String> {
+    fn call_closure(&mut self, num_args: usize, gc: Box<Gc>, debug: bool) -> Result<Value, String> {
         let mut pc = 0usize;
 
         if let Some(counter) = self.get_pc() {
@@ -2599,7 +2520,7 @@ impl VM {
         (
         &mut self,
         num_args: u8,
-        gc: &Gc,
+        gc: Box<Gc>,
     )
         {
         self.push_call_frame(num_args);
@@ -2989,7 +2910,7 @@ impl VM {
         println!("]");
     }
 
-    fn execute_math_op(&mut self, op: MathOp, gc: &Gc) -> Result<Value, String> {
+    fn execute_math_op(&mut self, op: MathOp, gc: Box<Gc>) -> Result<Value, String> {
         match op {
             MathOp::Add => self.execute_add(gc),
             MathOp::Subtract => self.execute_subtract(gc),
@@ -3003,7 +2924,7 @@ impl VM {
         }
     }
 
-    fn execute_math_assign_op(&mut self, op: MathOp, gc: &Gc) -> Result<Value, String> {
+    fn execute_math_assign_op(&mut self, op: MathOp, gc: Box<Gc>) -> Result<Value, String> {
         match op {
             MathOp::Add => self.execute_add_assign(gc),
             MathOp::Subtract => self.execute_subtract_assign(gc),
@@ -3017,7 +2938,7 @@ impl VM {
         }
     }
 
-    fn execute_add(&mut self, gc: &Gc) -> Result<Value, String> {
+    fn execute_add(&mut self, gc: Box<Gc>) -> Result<Value, String> {
         let arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3055,7 +2976,7 @@ impl VM {
         ))
     }
 
-    fn execute_subtract(&mut self, _gc: &Gc) -> Result<Value, String> {
+    fn execute_subtract(&mut self, _gc: Box<Gc>) -> Result<Value, String> {
         let arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3085,7 +3006,7 @@ impl VM {
         ))
     }
 
-    fn execute_multiply(&mut self, gc: &Gc) -> Result<Value, String> {
+    fn execute_multiply(&mut self, gc: Box<Gc>) -> Result<Value, String> {
         let arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3123,7 +3044,7 @@ impl VM {
         ))
     }
 
-    fn execute_divide(&mut self, _gc: &Gc) -> Result<Value, String> {
+    fn execute_divide(&mut self, _gc: Box<Gc>) -> Result<Value, String> {
         let arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3159,7 +3080,7 @@ impl VM {
         ))
     }
 
-    fn execute_modulo(&mut self, _gc: &Gc) -> Result<Value, String> {
+    fn execute_modulo(&mut self, _gc: Box<Gc>) -> Result<Value, String> {
         let arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3184,7 +3105,7 @@ impl VM {
         ))
     }
 
-    fn execute_power(&mut self, _gc: &Gc) -> Result<Value, String> {
+    fn execute_power(&mut self, _gc: Box<Gc>) -> Result<Value, String> {
         let arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3215,7 +3136,7 @@ impl VM {
     }
 
     // compound assignment math operators
-    fn execute_add_assign(&mut self, gc: &Gc) -> Result<Value, String> {
+    fn execute_add_assign(&mut self, gc: Box<Gc>) -> Result<Value, String> {
         let mut arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3256,7 +3177,7 @@ impl VM {
         ))
     }
 
-    fn execute_subtract_assign(&mut self, _gc: &Gc) -> Result<Value, String> {
+    fn execute_subtract_assign(&mut self, _gc: Box<Gc>) -> Result<Value, String> {
         let mut arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3288,7 +3209,7 @@ impl VM {
         ))
     }
 
-    fn execute_multiply_assign(&mut self, gc: &Gc) -> Result<Value, String> {
+    fn execute_multiply_assign(&mut self, gc: Box<Gc>) -> Result<Value, String> {
         let mut arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3329,7 +3250,7 @@ impl VM {
         ))
     }
 
-    fn execute_divide_assign(&mut self, _gc: &Gc) -> Result<Value, String> {
+    fn execute_divide_assign(&mut self, _gc: Box<Gc>) -> Result<Value, String> {
         let mut arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3367,7 +3288,7 @@ impl VM {
         ))
     }
 
-    fn execute_modulo_assign(&mut self, _gc: &Gc) -> Result<Value, String> {
+    fn execute_modulo_assign(&mut self, _gc: Box<Gc>) -> Result<Value, String> {
         let mut arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3393,7 +3314,7 @@ impl VM {
         ))
     }
 
-    fn execute_power_assign(&mut self, _gc: &Gc) -> Result<Value, String> {
+    fn execute_power_assign(&mut self, _gc: Box<Gc>) -> Result<Value, String> {
         let mut arg2 = self.stack.pop().unwrap();
         let mut arg1 = self.stack.pop().unwrap();
 
@@ -3427,7 +3348,7 @@ impl VM {
     fn execute(
         &mut self,
         compiler: &Compiler,
-        gc: &Gc,
+        gc: Box<Gc>,
         debug: bool,
         compile: bool,
     ) -> Result<Value, InterpretErrorType> {
@@ -3476,7 +3397,7 @@ impl VM {
     pub(crate) fn run(
         &mut self,
         compiler: &Compiler,
-        gc: &Gc,
+        gc: Box<Gc>,
         debug: bool,
         compile: bool,
     ) -> Result<Value, InterpretErrorType> {
@@ -3541,12 +3462,586 @@ struct FunCompiler {
     closure: Option<Managed<Closure>>,
 }
 
+impl FunCompiler {
+    fn new_main(compiler: &mut Compiler, ast: Box<Ast>, gc: &Gc) -> Self {
+        if compiler.symbols.calls.len() > 0 {
+            panic!("attempt to create new main with nonempty call stack");
+        }
+        Self::function_setup(compiler, ast, gc, "<main>", 0, 0, FunctionType::TopLevel)
+    }
 
+    fn new_named_closure(
+        compiler: &mut Compiler,
+        ast: &Ast,
+        gc: &Gc,
+        name: &str,
+        arity: usize,
+        scope: usize,
+    ) -> Self {
+        if compiler.symbols.calls.len() == 0 {
+            panic!("no main function when named closure was declared");
+        }
+        Self::function_setup(
+            compiler,
+            ast,
+            gc,
+            name,
+            arity,
+            scope,
+            FunctionType::NamedClosure,
+        )
+    }
 
+    fn new_anon_closure(
+        compiler: &mut Compiler,
+        ast: &Ast,
+        gc: &Gc,
+        arity: usize,
+        scope: usize,
+    ) -> Self {
+        if compiler.symbols.calls.len() == 0 {
+            panic!("no main function when anonymous closure was declared");
+        }
+        Self::function_setup(
+            compiler,
+            ast,
+            gc,
+            "",
+            arity,
+            scope,
+            FunctionType::AnonClosure,
+        )
+    }
+
+    /*fn new_function
+    (
+        compiler: &mut Compiler,
+        name: &str,
+        arity: usize,
+    ) -> Self
+    {
+        if compiler.symbols.calls.len() == 0 {
+            panic!("no main function when function was declared");
+        }
+    }*/
+
+    /*fn new_constructor
+    (
+        compiler: &mut Compiler,
+        arity: usize
+    ) -> Self
+    {
+        if compiler.symbols.calls.len() == 0 {
+            panic!("no main function when constructor was declared");
+        }
+    }*/
+
+    /*pub(crate) fn new_method
+    (
+        compiler: &mut Compiler,
+        name: &str,
+        arity: usize
+    ) -> Self
+    {
+        if compiler.symbols.calls.len() == 0 {
+            panic!("no main function when method was declared");
+        }
+    }*/
+
+    fn function_setup(
+        compiler: &mut Compiler,
+        ast: &Ast,
+        gc: &Gc,
+        name: &str,
+        arity: usize,
+        scope: usize,
+        ty: FunctionType,
+    ) -> Self {
+        let mut s = Self {
+            name: name.to_string(),
+            ty: ty,
+            min_scope: scope,
+            scope: scope,
+            arity: arity,
+            locals: vec![],
+            upvalues: vec![],
+            code: vec![],
+            constants: HashMap::new(),
+            constant_arr: vec![],
+            local_fun_symtab: HashMap::new(),
+            closure: None,
+        };
+        if s.ty == FunctionType::Constructor || s.ty == FunctionType::Method {
+            s.push_local(compiler, ast, gc, "this".to_string(), scope, false);
+        } else {
+            s.push_local(compiler, ast, gc, "".to_string(), scope, false);
+        }
+        compiler.symbols.calls.push(s.clone());
+        s
+    }
+
+    
+
+	fn resolve_other_var(
+		&mut self,
+		compiler: &Compiler,
+        funcom: &FunCompiler,
+		gc: Box<Gc>,
+		arity: Option<usize>,
+		print_err: bool,
+	) -> Result<VarInfo, VarError> {
+		resolve_local_or_upvalue(compiler, funcom, gc, arity, print_err)
+    }
+
+	fn resolve_local_or_upvalue(
+        &mut self,
+        compiler: Box<Compiler>,
+        funcom: &FunCompiler,
+        gc: &Gc,
+        token: Box<Gc>,
+        name: &String,
+        arity: Option<usize>,
+        do_print_on_err: bool,
+    ) -> Result<VarInfo, VarError> {
+        let result1 = match self.resolve_local(compiler, gc, token, &name, arity, do_print_on_err) {
+            Err(e) => e,
+            Ok(ok) => ok,
+        };
+
+        if let Err(_) = result1 {
+            return result1;
+        };
+
+        let result2 = match self.resolve_upvalue(compiler, gc, token, name, arity, do_print_on_err)
+        {
+            Err(e) => e,
+            Ok(ok) => ok,
+        };
+
+        if let Ok(local) = result1 {
+            if let Ok(upvalue) = result2 {
+                return result1;
+            }
+        }
+        result2
+    }
+
+    fn resolve_local(
+        &mut self,
+        compiler: Box<Compiler>,
+        funcom: &FunCompiler,
+        gc: Box<Gc>,
+        token: Box<Token>, // required for inner (*compiler).error()
+        arity: Option<usize>,
+        print_err: bool,
+    ) -> Result<VarInfo, VarError> {
+        resolve_local_internal(compiler, token, arity, print_err)
+    }
+
+    pub(crate) fn resolve_local_internal(
+        &mut self,
+        compiler: Box<Compiler>,
+        funcom: &FunCompiler,
+        gc: Box<Gc>,
+        token: Box<Token>, // required for (*compiler).error()
+        arity: Option<usize>,
+        print_err: bool,
+    ) -> Result<VarInfo, VarError> {
+        for i in (0..self.locals.len()).rev() {
+            if self.locals[i].name == token.lexeme {
+                if !self.locals[i].defined && print_err {
+                    compiler.error(
+                        token,
+                        "self-initialization of local variable '".to_string()
+                            + &mut self.locals[i].name,
+                    );
+                    return Err(VarError::new(
+                        self.locals[i].name.clone(),
+                        VarType::Var,
+                        ScopeType::Local,
+                        AccessType::None,
+                        VarErrorType::SelfInit,
+                        i,
+                    ));
+                } else {
+                	if arity.is_some() {
+                		return Ok(VarInfo::new(
+		                    self.locals[i].name.clone(),
+		                    arity,
+		                    VarType::Function,
+		                    ScopeType::Local,
+		                    AccessType::None,
+		                    self.locals[i].scope,
+		                    i,
+		                    0,
+		                ));
+		            } else {
+		                return Ok(VarInfo::new(
+		                    self.locals[i].name.clone(),
+		                    None,
+		                    VarType::Var,
+		                    ScopeType::Local,
+		                    AccessType::None,
+		                    self.locals[i].scope,
+		                    i,
+		                    0,
+		                ));
+		            }
+                }
+            }
+        }
+
+        Err(VarError::new(
+            token.lexeme.clone(),
+            VarType::Var,
+            ScopeType::Local,
+            AccessType::None,
+            VarErrorType::Undefined,
+            0,
+        ))
+    }
+
+    pub(crate) fn resolve_upvalue(
+        &mut self,
+        compiler:  Box<Compiler>,
+        funcom: &FunCompiler
+        gc: Box<Gc>,
+        token: Box<Token>,
+        arity: Option<usize>,
+        do_print_on_error: bool,
+    ) -> Result<VarInfo, VarError> {
+        resolve_upvalue_internal(
+            compiler,
+            token,
+            gc,
+            arity,
+            do_print_on_error,
+            compiler.symbols.calls.iter().rev(),
+        )
+    }
+
+    pub(crate) fn resolve_upvalue_internal(
+        &mut self,
+        compiler: Box<Compiler>,
+        funcom: &FunCompiler,
+        gc: Box<Gc>,
+        token: Box<Token>,
+        arity: Option<usize>,
+        print_error: bool,
+        mut iter: Rev<std::slice::IterMut<'_, FunCompiler>>,
+    ) -> Result<VarInfo, VarError> {
+        let mut fc = iter.next();
+        if let Some(ref mut fun_compiler) = fc {
+            let local = fun_compiler.resolve_local_internal(compiler, token, gc, arity, true);
+            match local {
+                Ok(var_info) => {
+                    if let Some(fun_compiler) = fc {
+                        fun_compiler.locals[var_info.index].upvalue = true;
+                        return fun_compiler.add_upvalue(
+                            compiler,
+                            token,
+                            gc,
+                            arity,
+                            var_info.upvalue_local_index,
+                            true,
+                        );
+                    }
+                }
+                _ => {}
+            }
+
+            fc = iter.next();
+            if fc.is_some() {
+                if let Some(fun_compiler) = fc {
+                    let upvalue = fun_compiler
+                        .resolve_upvalue_internal(compiler, token, gc, arity, false, iter);
+
+                    match upvalue {
+                        Ok(var_info) => {
+                            if let Some(last) = compiler.symbols.calls.last_mut() {
+                                return last.add_upvalue(
+                                    compiler,
+                                    token,
+                                    gc,
+                                    arity,
+                                    var_info.upvalue_local_index,
+                                    false,
+                                );
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+
+        Err(VarError::new(
+           	token.lexeme.clone(),
+            VarType::Var,
+            ScopeType::UpvalueEntry,
+            AccessType::None,
+            VarErrorType::Undefined,
+            0,
+        ))
+    }
+
+    fn add_upvalue(
+        &mut self,
+        compiler: Box<Compiler>,
+        funcom: &FunCompiler,
+        gc: Box<Gc>,
+        token: Box<Token>,
+        name: &String,
+        arity: Option<usize>,
+        index: usize,
+        is_local: bool,
+    ) -> Result<VarInfo, VarError> {
+        for i in 0..self.locals.len() {
+            if i == index && is_local {
+                return Ok(VarInfo::new(
+                    self.locals[i].name.clone(),
+                    arity,
+                    VarType::Var,
+                    ScopeType::UpvalueEntry,
+                    AccessType::None,
+                    self.locals[i].scope,
+                    i,
+                    0,
+                ));
+            }
+        }
+
+        if self.upvalues.len() >= MAX_UPVALUES {
+            compiler.error(token, "too many upvalues".to_string());
+            return Err(VarError::new(
+                name.clone(),
+                VarType::Var,
+                ScopeType::UpvalueEntry,
+                AccessType::None,
+                VarErrorType::TooMany,
+                MAX_UPVALUES,
+            ));
+        }
+
+        let upvalue = UpvalueEntry::new(is_local, index);
+        self.upvalues.push(upvalue);
+
+        Ok(VarInfo::new(
+            self.locals[index].name.clone(),
+            arity,
+            VarType::Var,
+            ScopeType::UpvalueEntry,
+            AccessType::None,
+            self.locals[index].scope,
+            self.upvalues.len() - 1,
+            index,
+        ))
+    }
+
+    fn push_local(
+        &mut self,
+        compiler: Box<Compiler>,
+        funcomp: &mut FunCompiler,
+        _gc:Box<Gc>,
+        token: Box<Token>,
+        scope: usize,
+        upvalue: bool,
+    ) -> Option<&mut LocalEntry> {
+        if self.locals.len() == MAX_LOCALS {
+            compiler.error(ast, "too many locals in function".to_string());
+            return None;
+        }
+        self.locals
+            .push(LocalEntry::new(name.to_string(), scope, upvalue));
+
+        self.locals.last_mut()
+    }
+
+    fn declare_local(
+        &mut self,
+        compiler: &mut Compiler,
+        funcom: &mut FunCompiler
+        gc: Box<Gc>,
+        token: Box<Token>,
+        arity: Option<usize>,
+        print_error: bool,
+    ) -> Result<VarInfo, VarError> {
+        let mut actual_name = "".to_string();
+        if let Some(a) = arity {
+            // format name, arity
+            actual_name = format!("{}(#{})", name, a);
+        } else {
+            // just the name
+            actual_name = name.to_string();
+        }
+        let mut iter = self.locals.iter_mut().rev();
+        let mut scope = 0usize;
+        loop {
+            let i = iter.next();
+            if i.is_none() {
+                break;
+            }
+            if i.unwrap().scope < self.scope {
+                scope = i.unwrap().scope;
+                break;
+            }
+            if i.unwrap().name == *actual_name {
+                if print_error {
+                    compiler.error(
+                        ast,
+                        "local variable '".to_string() + &i.unwrap().name + "' already exists",
+                    );
+                }
+                return Err(VarError::new(
+                    actual_name.clone(),
+                    VarType::Var,
+                    ScopeType::LocalEntry,
+                    AccessType::None,
+                    VarErrorType::AlreadyExists,
+                    i.unwrap().scope,
+                ));
+            }
+        }
+        self.push_local(compiler, ast, gc, actual_name.clone(), scope, false);
+
+        Ok(VarInfo::new(
+            actual_name.clone(),
+            arity,
+            VarType::Var,
+            ScopeType::LocalEntry,
+            AccessType::None,
+            scope,
+            self.locals.len() - 1,
+            0,
+        ))
+    }
+
+    fn declare_local_function(
+        &mut self,
+        compiler: &mut Compiler,
+        ast: &Ast,
+        gc: &Gc,
+        name: &String,
+        arity: usize,
+        print_err: bool,
+    ) -> Result<VarInfo, VarError> {
+        let fun_name = format!("{}(#{})", name, arity as u32);
+        if self.local_fun_symtab.get(&fun_name).is_some() {
+            compiler.error(ast, format!("local function '{}' already exists", fun_name));
+            Err(VarError::new(
+                fun_name,
+                VarType::Function,
+                ScopeType::LocalEntry,
+                AccessType::None,
+                VarErrorType::AlreadyExists,
+                self.get_scope_depth(),
+            ))
+        } else {
+            let closure = self.closure.unwrap();
+            let constant = self.get_constant(&Value::Closure(closure));
+            let fun = VarInfo::new(
+                fun_name.clone(),
+                Some(arity),
+                VarType::Var,
+                ScopeType::LocalEntry,
+                AccessType::None,
+                self.get_scope_depth(),
+                constant,
+                0,
+            );
+            self.local_fun_symtab.insert(fun_name.clone(), fun.clone());
+
+            Ok(fun.clone())
+        }
+    }
+
+    fn get_scope_depth(&mut self) -> usize {
+        self.scope
+    }
+
+    fn begin_scope(&mut self) {
+        self.scope += 1;
+    }
+
+    fn end_scope(&mut self) {
+        if self.scope > 0 {
+            self.scope -= 1;
+        }
+    }
+
+    fn get_constant(&mut self, val: &Value) -> usize {
+        let len = self.constants.len();
+
+        let pair = self.constants.get_key_value(val);
+        if pair.is_none() {
+            self.constants.insert(val.clone(), self.constants.len());
+            self.constant_arr.push(val.clone());
+        } else {
+            return *pair.unwrap().1;
+        }
+        return len;
+    }
+
+    fn emit_op(&mut self, opcode: OpCode) {
+        #[cfg(feature = "debug_opcode")]
+        println!(
+            "gen: {}: {}",
+            self.closure.unwrap().get_core().get_name(),
+            opcode
+        );
+        self.code.push(u8::from(opcode));
+    }
+
+    fn emit_byte_op(&mut self, opcode: OpCode, byte: u8) {
+        #[cfg(feature = "debug_opcode")]
+        println!(
+            "gen: {}: {} byte {}",
+            self.closure.unwrap().get_core().get_name(),
+            opcode,
+            byte
+        );
+        self.code.push(u8::from(opcode));
+        self.code.push(byte);
+    }
+
+    fn emit_word_op(&mut self, opcode: OpCode, word: usize) {
+        #[cfg(feature = "debug_opcode")]
+        println!(
+            "gen: {}: {} word {}",
+            self.closure.unwrap().get_core().get_name(),
+            opcode,
+            word
+        );
+        self.code.push(u8::from(opcode));
+        self.code.push(((word >> 8) & 0xff) as u8);
+        self.code.push((word & 0xff) as u8);
+    }
+
+    fn emit_three_byte_op(&mut self, opcode: OpCode, three_byte: u32) {
+        #[cfg(feature = "debug_opcode")]
+        println!(
+            "gen: {}: {} three byte {}",
+            self.closure.unwrap().get_core().get_name(),
+            opcode,
+            three_byte
+        );
+        self.code.push(u8::from(opcode));
+        self.code.push(((three_byte >> 16) & 0xff) as u8);
+        self.code.push(((three_byte >> 8) & 0xff) as u8);
+        self.code.push((three_byte & 0xff) as u8);
+    }
+
+    fn emit_math_op(&mut self, op: MathOp) {
+        println!("gen: {} op {}", OpCode::MathOp, op);
+        self.code.push(u8::from(OpCode::MathOp));
+        self.code.push(u8::from(op));
+    }
+}
 
 
 #[derive(Clone, PartialEq)]
 enum VarType {
+	Module,
     Var,
     Function,
     NamedClosure,
@@ -3557,11 +4052,88 @@ enum VarType {
     Const,
 }
 
+
+
 #[derive(Clone, PartialEq)]
 enum ScopeType {
-    Ns,
-    Local,
-    Upvalue,
+    None,
+    Module,
+    LocalEntry,
+    UpvalueEntry,
+    Class,
+}
+
+#[derive(Clone, PartialEq)]
+enum AccessType {
+    None,
+	Public,
+	Private,
+}
+
+#[derive(Clone)]
+struct VarInfo {
+    name: String,
+    arity: Option<usize>,
+    var_type: VarType,
+    scope_type: ScopeType,
+    access_type: AccessType,
+    scope: usize,
+    index: usize,
+    upvalue_local_index: usize,
+}
+
+impl VarInfo {
+    fn new
+	(
+        name: String,
+        arity: Option<usize>,
+        var_type: VarType,
+        scope_type: ScopeType,
+        access_type: AccessType,
+        scope: usize,
+        index: usize,
+        upvalue_local_index: usize,
+	) -> Self
+    {
+        Self {
+            name,
+            arity,
+            var_type,
+            scope_type,
+            access_type,
+            scope,
+            index,
+            upvalue_local_index,
+        }
+    }
+
+    fn get_name(&mut self) -> String {
+        self.name.clone()
+    }
+
+    fn get_arity(&mut self) -> Option<usize> {
+        self.arity
+    }
+
+    fn get_var_type(&mut self) -> VarType {
+        self.var_type.clone()
+    }
+
+    fn get_scope_type(&mut self) -> ScopeType {
+        self.scope_type.clone()
+    }
+
+    fn get_access_type(&self) -> AccessType {
+        self.access_type.clone()
+    }
+
+    fn get_scope_level(&mut self) -> usize {
+        self.scope
+    }
+
+    fn get_index(&mut self) -> usize {
+        self.index
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -3574,26 +4146,68 @@ enum VarErrorType {
     Other,
 }
 
-
-
 #[derive(Clone)]
 struct VarError {
     name: String,
+    var_type: VarType,
+    scope_type: ScopeType,
+    access_type: AccessType,
     error_type: VarErrorType,
+    scope_level: usize,
 }
 
 impl VarError {
-    fn new(name: String, error_type: VarErrorType) -> Self {
-        Self { name, error_type }
+    fn new(
+        name: String,
+        var_type: VarType,
+        scope_type: ScopeType,
+        access_type: AccessType,
+        error_type: VarErrorType,
+        scope_level: usize
+    ) -> Self
+    {
+        Self {
+            name,
+            var_type,
+            scope_type,
+            access_type,
+            error_type,
+            scope_level,
+        }
     }
 
-    fn get_name(&self) -> String {
+    fn get_name(&mut self) -> String{
         self.name.clone()
+    }
+
+    fn get_var_type(&self) -> VarType {
+        self.var_type.clone()
+    }
+
+    fn get_scope_type(&self) -> ScopeType {
+        self.scope_type.clone()
     }
 
     fn get_error_type(&self) -> VarErrorType {
         self.error_type.clone()
     }
+
+    fn get_scope_level(&self) -> usize {
+        self.scope_level
+    }
+}
+
+impl Default for VarError {
+	fn default() -> Self {
+		Self {
+			name: "".to_string(),
+			var_type: VarType::None,
+			scope_type: ScopeType::None,
+			access_type: AccessType::None,
+			error_type: VarErrorType::None,
+			scope_level: 0,
+		}
+	}
 }
 
 #[cfg(test)]

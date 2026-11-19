@@ -459,7 +459,7 @@ impl Lexer {
         }
     }
 
-    pub fn scan(&mut self, gc: &Gc) -> Token {
+    pub fn scan_token(&mut self, gc: &Gc) -> Token {
         if !self.skip_whitespace() {
             return Token::new(
                 TokenKind::Err,
@@ -1100,7 +1100,7 @@ mod tests {
         let gc = Gc::new();
         let mut l = Lexer::new_from_string(string);
         loop {
-            let result = l.scan(&gc);
+            let result = l.scan_token(&gc);
             if result.kind == TokenKind::Done {
                 return;
             }
