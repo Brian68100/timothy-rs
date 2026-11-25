@@ -4,7 +4,7 @@ use crate::gc::{Gc, NO_GC};
 use crate::lexer::*;
 use crate::token::*;
 use crate::value::*;
-use std::cell:RefCell;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 pub(crate) const MAX_LOCALS: usize = 256;
@@ -270,7 +270,7 @@ impl<'a> Parser {
     }
     pub fn parse_file(
     	&self, 
-    	fname: String
+    	fname: String,
     	debug: bool,
     	compile: bool) -> Result<Value, InterpretErrorType> {
         self.lexer_stack = vec![];
@@ -702,12 +702,10 @@ impl<'a> Parser {
                 if !self.consume(TokenKind::Ident, "parameter name expected".to_string(), gc) {
                     return false;
                 }
-                compiler.add_var
-                    (
-                        self.previous().lexeme.clone(),
-                        arity,        
-                    )
-                });
+                compiler.add_var (
+                    self.previous().lexeme.clone(),
+                    arity,        
+                )
                 params.push(param);
 
                 self.match_token(TokenKind::Comma, gc);
